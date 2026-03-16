@@ -15,11 +15,14 @@
 - `app/services/tasks.py`：扫描编排与 Celery 任务（并发调用 A/B/C/D）
 - `app/services/file_ingest.py`：文件获取与目录树解析
 - `app/schemas/scan.py`：扫描请求/响应模型
+- `app/core/database.py`：MySQL 异步连接与会话
+- `app/models/file_ingest.py`：文件解析结果表模型（目录树 + meta 入库）
 
 ## 依赖
 
 - Python 3.10+
 - Redis（用于队列与结果存储）
+- MySQL（用于文件目录树解析结果持久化；启动时若不可用仅打日志，不中断）
 
 ## 快速开始（Windows PowerShell）
 
@@ -37,6 +40,8 @@ pip install -r requirements-dev.txt
 ```bash
 copy .env.example .env
 ```
+
+编辑 `.env` 配置 Redis 与 **MySQL**（`MYSQL_HOST` / `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DATABASE` 等）。需先创建库：`CREATE DATABASE compliance_gateway CHARACTER SET utf8mb4;`
 
 3) 启动 Redis（任选一种）
 
@@ -106,11 +111,12 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - `source_url`：文件/压缩包 URL（支持 `github` / `gitee` / `gitcode` 的 `blob` 链接，服务端会自动转换为可下载的 raw 链接）
 - `file`：上传文件/压缩包（`zip` / `tar` / `tar.gz` / `tgz` 或普通文件）
 
-返回目录树结构（每个节点）：
+解析完成后会将 **目录树与 meta 写入 MySQL**（表 `file_ingest_result`），响应中带 `ingest_id`（主键）便于后续按 ID 查询。
 
-- `path`: 节点路径（根节点为解压根目录名或 `upload`）
-- `next`: 子节点（对象映射；无子节点时为 `{}`）
-- `content`: 非叶子节点为 `null`；叶子节点为 JSON（文本文件为 `{"text": "...", ...}`；二进制文件为 `{"binary": true, "base64": "...", ...}`）
+返回字段：
+
+- `ok`, `ingest_id`, `meta`, `tree`
+- 树节点结构：`path`（节点路径）、`next`（子节点映射）、`content`（目录为 `null`；文件为 JSON，如 `{"text": "..."}` 或 `{"binary": true, "base64": "..."}`）
 
 ## 下游服务约定（四模块通用）
 

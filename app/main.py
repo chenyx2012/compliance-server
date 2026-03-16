@@ -6,22 +6,34 @@ from __future__ import annotations
 职责：
 - 面向前端提供统一的 HTTP API；
 - 并发调用 4 个可独立部署的扫描模块服务（A/B/C/D）并聚合结果；
-- 对于耗时/高并发场景，将请求投递到队列（Celery+Redis），前端用 request_id 轮询结果。
+- 对于耗时/高并发场景，将请求投递到队列（Celery+Redis），前端用 request_id 轮询结果；
+- 文件拉取/解析结果写入 MySQL。
 """
 
+from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
 from celery.result import AsyncResult
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.celery_app import celery_app
 from app.core.config import settings
+from app.core.database import get_db, init_db
+from app.models.file_ingest import FileIngestResult
 from app.schemas.scan import ScanRequest
 from app.services.file_ingest import ingest_from_upload, ingest_from_url
 from app.services.tasks import MODULES, _run_scan_async, scan_task
 
 
-app = FastAPI(title=settings.app_name)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用启动时初始化 MySQL 表。"""
+    await init_db()
+    yield
+
+
+app = FastAPI(title=settings.app_name, lifespan=lifespan)
 
 
 def _normalize_modules(modules: Optional[List[str]]) -> Optional[List[str]]:
@@ -83,14 +95,17 @@ def scan_result(request_id: str) -> Dict[str, Any]:
 async def files_ingest(
     source_url: Optional[str] = Form(default=None, description="文件/压缩包 URL（支持 github/gitee/gitcode 的 blob 链接）"),
     file: Optional[UploadFile] = File(default=None, description="上传文件/压缩包（zip/tar/tar.gz/tgz 或普通文件）"),
+    db: AsyncSession = Depends(get_db),
 ) -> Dict[str, Any]:
     """
-    获取文件并解析为目录树。
+    获取文件并解析为目录树，结果写入 MySQL。
 
     输出节点结构：
     - path: str
     - next: { name: node, ... }
     - content: None | JSON（叶子文件内容）
+
+    响应中 ingest_id 为本次写入的数据库主键，可用于后续查询。
     """
     if (source_url is None or not source_url.strip()) and file is None:
         raise HTTPException(status_code=400, detail="either source_url or file is required")
@@ -99,10 +114,21 @@ async def files_ingest(
 
     if source_url is not None and source_url.strip():
         tree, meta = await ingest_from_url(source_url.strip(), timeout_seconds=60.0)
-        return {"ok": True, "meta": meta, "tree": tree}
+    else:
+        assert file is not None
+        data = await file.read()
+        tree, meta = await ingest_from_upload(file.filename or "upload.bin", data)
 
-    assert file is not None
-    data = await file.read()
-    tree, meta = await ingest_from_upload(file.filename or "upload.bin", data)
-    return {"ok": True, "meta": meta, "tree": tree}
+    source_type = meta.get("source", "unknown")
+    source_label = meta.get("url") or meta.get("filename") or ""
+    row = FileIngestResult(
+        source_type=source_type,
+        source_label=source_label[:512] if source_label else None,
+        meta=meta,
+        tree=tree,
+    )
+    db.add(row)
+    await db.flush()
+    ingest_id = row.id
+    return {"ok": True, "ingest_id": ingest_id, "meta": meta, "tree": tree}
 

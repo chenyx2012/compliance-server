@@ -1,1 +1,2 @@
 pytest>=8.0
+aiosqlite>=0.19

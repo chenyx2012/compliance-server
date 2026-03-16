@@ -44,7 +44,7 @@ def test_build_dir_tree_text_leaf(tmp_path):
     assert leaf["content"]["text"].replace("\r\n", "\n") == "print('hi')\n"
 
 
-def test_files_ingest_upload_zip():
+def test_files_ingest_upload_zip(override_get_db):
     client = TestClient(app)
     zbytes = _mk_zip_bytes(
         {
@@ -57,6 +57,7 @@ def test_files_ingest_upload_zip():
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["ok"] is True
+    assert "ingest_id" in body
     assert body["meta"]["source"] == "upload"
     assert body["meta"]["type"] == "archive"
 
@@ -67,7 +68,7 @@ def test_files_ingest_upload_zip():
     assert readme["content"]["text"].startswith("# hello")
 
 
-def test_files_ingest_url_mock_download(monkeypatch):
+def test_files_ingest_url_mock_download(monkeypatch, override_get_db):
     """
     Avoid real network: monkeypatch app.file_ingest.download_to_temp to return a temp zip.
     """
@@ -90,6 +91,7 @@ def test_files_ingest_url_mock_download(monkeypatch):
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["ok"] is True
+    assert "ingest_id" in body
     assert body["meta"]["source"] == "url"
     assert body["meta"]["type"] == "archive"
 

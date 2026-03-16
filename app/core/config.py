@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Optional
+from urllib.parse import quote_plus
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -35,6 +36,24 @@ class Settings(BaseSettings):
     redis_url: str = Field(default="redis://127.0.0.1:6379/0", alias="REDIS_URL")
     celery_task_queue: str = Field(default="compliance_scan", alias="CELERY_TASK_QUEUE")
     celery_result_expires_seconds: int = Field(default=86400, alias="CELERY_RESULT_EXPIRES_SECONDS")
+
+    # MySQL：文件目录树等持久化
+    mysql_host: str = Field(default="127.0.0.1", alias="MYSQL_HOST")
+    mysql_port: int = Field(default=3306, alias="MYSQL_PORT")
+    mysql_user: str = Field(default="root", alias="MYSQL_USER")
+    mysql_password: str = Field(default="", alias="MYSQL_PASSWORD")
+    mysql_database: str = Field(default="compliance_gateway", alias="MYSQL_DATABASE")
+    mysql_charset: str = Field(default="utf8mb4", alias="MYSQL_CHARSET")
+
+    @property
+    def database_url(self) -> str:
+        """异步驱动 aiomysql，用于 SQLAlchemy create_async_engine。"""
+        user = quote_plus(self.mysql_user)
+        password = quote_plus(self.mysql_password)
+        return (
+            f"mysql+aiomysql://{user}:{password}"
+            f"@{self.mysql_host}:{self.mysql_port}/{self.mysql_database}?charset={self.mysql_charset}"
+        )
 
 
 settings = Settings()

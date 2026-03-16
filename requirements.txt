@@ -7,3 +7,5 @@ celery>=5.3
 redis>=5.0
 python-dotenv>=1.0
 python-multipart>=0.0.9
+sqlalchemy[asyncio]>=2.0
+aiomysql>=0.2
