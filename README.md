@@ -24,46 +24,83 @@
 - Redis（用于队列与结果存储）
 - MySQL（用于文件目录树解析结果持久化；启动时若不可用仅打日志，不中断）
 
-## 快速开始（Windows PowerShell）
+## 快速开始
 
-1) 安装依赖
+以下命令在 **Windows（PowerShell）** 与 **Linux/macOS（Bash）** 下均可用，仅虚拟环境激活方式不同。
 
-```bash
+### 1) 安装依赖
+
+**Windows (PowerShell)：**
+
+```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 pip install -r requirements-dev.txt
 ```
 
-2) 准备配置
+**Linux / macOS：**
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -r requirements-dev.txt
+```
+
+### 2) 准备配置
+
+```powershell
 copy .env.example .env
 ```
 
 编辑 `.env` 配置 Redis 与 **MySQL**（`MYSQL_HOST` / `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DATABASE` 等）。需先创建库：`CREATE DATABASE compliance_gateway CHARACTER SET utf8mb4;`
 
-3) 启动 Redis（任选一种）
+### 3) 启动 Redis
 
-- Docker：
+任选一种方式，保证 `.env` 中 `REDIS_URL` 可连即可：
+
+- **Docker（Windows / Linux 通用）：**
 
 ```bash
 docker compose up -d
 ```
 
-- 或者安装本机 Redis 并确保 `.env` 的 `REDIS_URL` 可用
+- 或本机安装 Redis 并启动服务
 
-4) 启动 Celery worker（队列消费者）
+### 4) 启动 Celery worker（队列消费者）
+
+**Windows** 下 Celery 不支持默认的 fork 进程池，必须加 `--pool=solo`（或 `--pool=threads`）：
+
+```powershell
+celery -A app.core.celery_app:celery_app worker -l INFO -Q compliance_scan --pool=solo
+```
+
+**Linux / macOS** 可使用默认池：
 
 ```bash
 celery -A app.core.celery_app:celery_app worker -l INFO -Q compliance_scan
 ```
 
-5) 启动网关 API
+### 5) 启动网关 API
 
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
+
+### 使用脚本启动（Windows）
+
+在项目根目录、已激活 `.venv` 的前提下，可分别开两个终端执行：
+
+```powershell
+.\scripts\start_celery_win.ps1
+```
+
+```powershell
+.\scripts\start_api_win.ps1
+```
+
+脚本会自动切到项目根目录；Celery 脚本已带 `--pool=solo`，无需再改。
 
 ## 接口说明
 
