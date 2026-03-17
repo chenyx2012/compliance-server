@@ -93,7 +93,7 @@ def scan_result(request_id: str) -> Dict[str, Any]:
 
 @app.post("/files/ingest")
 async def files_ingest(
-    source_url: Optional[str] = Form(default=None, description="文件/压缩包 URL（支持 github/gitee/gitcode 的 blob 链接）"),
+    source_url: Optional[str] = Form(default=None, description="Git 仓库地址，支持带 .git 和不带两种，如 https://github.com/owner/repo 或 https://github.com/owner/repo.git"),
     file: Optional[UploadFile] = File(default=None, description="上传文件/压缩包（zip/tar/tar.gz/tgz 或普通文件）"),
     db: AsyncSession = Depends(get_db),
 ) -> Dict[str, Any]:
@@ -113,7 +113,10 @@ async def files_ingest(
         raise HTTPException(status_code=400, detail="only one of source_url or file is allowed")
 
     if source_url is not None and source_url.strip():
-        tree, meta = await ingest_from_url(source_url.strip(), timeout_seconds=60.0)
+        try:
+            tree, meta = await ingest_from_url(source_url.strip(), timeout_seconds=300)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
     else:
         assert file is not None
         data = await file.read()

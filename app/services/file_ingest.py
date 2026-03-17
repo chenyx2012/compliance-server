@@ -3,15 +3,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
-import posixpath
 import sys
 import tarfile
 import tempfile
 import zipfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
-
-import httpx
 
 from app.core.config import settings
 
@@ -34,53 +31,45 @@ DEFAULT_IGNORE_DIRS = {
 }
 
 
-def _safe_join_url(base: str, *parts: str) -> str:
-    p = "/".join([base.rstrip("/"), *[s.strip("/") for s in parts]])
-    return p
-
-
-def normalize_git_hosted_url(url: str) -> str:
+def normalize_git_clone_url(url: str) -> str:
+    """
+    规范化为可 git clone 的仓库地址，支持带 .git 和不带两种。
+    不修改协议与路径，仅去除首尾空白；若含 /blob/ 等则视为非法仓库 URL。
+    """
     u = url.strip()
+    if not u:
+        raise ValueError("git url is empty")
     lower = u.lower()
-
+    # 明确是压缩包或单文件地址则不允许
     if any(lower.endswith(s) for s in (".zip", ".tar.gz", ".tgz", ".tar")):
-        return u
-
-    if "github.com/" in lower and "/blob/" in lower:
-        try:
-            _, after = u.split("github.com/", 1)
-            owner_repo, rest = after.split("/blob/", 1)
-            ref, file_path = rest.split("/", 1)
-            return _safe_join_url("https://raw.githubusercontent.com", owner_repo, ref, file_path)
-        except ValueError:
-            return u
-
-    for host in ("gitee.com", "gitcode.com"):
-        if host in lower and "/blob/" in lower:
-            return u.replace("/blob/", "/raw/")
-
+        raise ValueError("url looks like an archive; use a git repo url (with or without .git)")
+    if "/blob/" in lower or "/raw/" in lower or "/tree/" in lower:
+        raise ValueError("url looks like a file/blob url; use repo root url, e.g. https://github.com/owner/repo or https://github.com/owner/repo.git")
     return u
 
 
-def _detect_filename_from_url(url: str) -> str:
+async def _clone_repo(git_url: str, dest_dir: Path, *, timeout_seconds: int = 300) -> Path:
+    """
+    将 git 仓库 clone 到 dest_dir，返回仓库根目录（即 dest_dir 本身）。
+    git_url 支持带 .git 和不带两种；使用浅克隆 --depth 1。
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    cmd = ["git", "clone", "--depth", "1", "--single-branch", git_url, str(dest_dir)]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
     try:
-        name = posixpath.basename(url.split("?", 1)[0].split("#", 1)[0])
-        return name or "download"
-    except Exception:
-        return "download"
-
-
-async def download_to_temp(url: str, *, timeout_seconds: float = 60.0) -> Tuple[Path, str]:
-    filename = _detect_filename_from_url(url)
-    with tempfile.NamedTemporaryFile(delete=False) as f:
-        tmp_path = Path(f.name)
-
-    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout_seconds) as client:
-        r = await client.get(url)
-        r.raise_for_status()
-        tmp_path.write_bytes(r.content)
-
-    return tmp_path, filename
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise ValueError("git clone timeout")
+    if proc.returncode != 0:
+        err = (stderr or stdout or b"").decode("utf-8", errors="replace").strip()
+        raise ValueError(f"git clone failed: {err}")
+    return dest_dir
 
 
 def _is_zip(path: Path) -> bool:
@@ -229,28 +218,35 @@ def build_dir_tree(
     return root_node
 
 
-async def ingest_from_url(url: str, *, timeout_seconds: float = 60.0) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    normalized = normalize_git_hosted_url(url)
-    tmp_file, filename = await download_to_temp(normalized, timeout_seconds=timeout_seconds)
+async def ingest_from_url(
+    url: str,
+    *,
+    timeout_seconds: int = 300,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    通过 git clone 获取仓库代码并解析为目录树。
+    url 支持带 .git 和不带两种，例如：
+    - https://github.com/owner/repo
+    - https://github.com/owner/repo.git
+    - https://gitee.com/owner/repo.git
+    """
+    clone_url = normalize_git_clone_url(url)
 
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
-
-        if _is_zip(tmp_file) or _is_tar(tmp_file):
-            _extract_archive(tmp_file, td_path)
-            root = _pick_single_root(td_path)
-            s3_err = await _upload_extracted_folder_to_s3(root)
-            tree = build_dir_tree(root, display_root=root.name)
-            meta = {"source": "url", "url": url, "normalized_url": normalized, "type": "archive", "filename": filename, "s3_upload": "Success" if s3_err is None else s3_err}
-            return tree, meta
-
-        single_root = td_path / "upload"
-        single_root.mkdir(parents=True, exist_ok=True)
-        dest = single_root / (filename or tmp_file.name)
-        dest.write_bytes(tmp_file.read_bytes())
-        s3_err = await _upload_extracted_folder_to_s3(single_root)
-        tree = build_dir_tree(single_root, display_root=single_root.name)
-        meta = {"source": "url", "url": url, "normalized_url": normalized, "type": "file", "filename": filename, "s3_upload": "Success" if s3_err is None else s3_err}
+        repo_root = td_path / "repo"
+        await _clone_repo(clone_url, repo_root, timeout_seconds=timeout_seconds)
+        s3_err = await _upload_extracted_folder_to_s3(repo_root)
+        tree = build_dir_tree(repo_root, display_root=repo_root.name)
+        meta = {
+            "source": "url",
+            "url": url,
+            "type": "git",
+            "clone_url": clone_url,
+            "s3_upload": "Success" if s3_err is None else s3_err,
+        }
+        if s3_err:
+            meta["s3_upload_error"] = s3_err
         return tree, meta
 
 
@@ -263,7 +259,7 @@ async def ingest_from_upload(
         tmp = td_path / (uploaded_filename or "upload.bin")
         tmp.write_bytes(data)
 
-        if _is_zip(tmp) or _is_tar(tmp):
+        if _is_zip(tmp) or _is_tar(tmp): 
             extract_dir = td_path / "extract"
             extract_dir.mkdir(parents=True, exist_ok=True)
             _extract_archive(tmp, extract_dir)

@@ -68,36 +68,35 @@ def test_files_ingest_upload_zip(override_get_db):
     assert readme["content"]["text"].startswith("# hello")
 
 
-def test_files_ingest_url_mock_download(monkeypatch, override_get_db):
+def test_files_ingest_url_mock_clone(monkeypatch, override_get_db):
     """
-    Avoid real network: monkeypatch app.file_ingest.download_to_temp to return a temp zip.
+    通过 URL 拉取改为 git clone；测试时 mock _clone_repo 避免真实 clone。
     """
     import tempfile
     from pathlib import Path
 
     import app.services.file_ingest as fi
 
-    zbytes = _mk_zip_bytes({"repo/a.txt": b"abc\n"})
+    async def fake_clone(git_url: str, dest_dir: Path, *, timeout_seconds: int = 300):
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        (dest_dir / "a.txt").write_text("abc\n", encoding="utf-8")
+        (dest_dir / "README.md").write_text("# repo\n", encoding="utf-8")
+        return dest_dir
 
-    async def fake_download_to_temp(url: str, *, timeout_seconds: float = 60.0):
-        fd, p = tempfile.mkstemp(suffix=".zip")
-        Path(p).write_bytes(zbytes)
-        return Path(p), "fake.zip"
-
-    monkeypatch.setattr(fi, "download_to_temp", fake_download_to_temp)
+    monkeypatch.setattr(fi, "_clone_repo", fake_clone)
 
     client = TestClient(app)
-    resp = client.post("/files/ingest", data={"source_url": "https://github.com/o/r/blob/main/a.zip"})
+    resp = client.post("/files/ingest", data={"source_url": "https://github.com/o/r.git"})
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["ok"] is True
     assert "ingest_id" in body
     assert body["meta"]["source"] == "url"
-    assert body["meta"]["type"] == "archive"
+    assert body["meta"]["type"] == "git"
 
     tree = body["tree"]
-    print("\n[tree:test_files_ingest_url_mock_download]\n" + json.dumps(tree, ensure_ascii=False, indent=2))
-    a_txt = _find_node_by_path(tree, "a.txt") or _find_node_by_path(tree, "repo/a.txt")
+    print("\n[tree:test_files_ingest_url_mock_clone]\n" + json.dumps(tree, ensure_ascii=False, indent=2))
+    a_txt = _find_node_by_path(tree, "a.txt")
     assert a_txt is not None
-    assert a_txt["content"]["text"] == "abc\n"
+    assert a_txt["content"]["text"].replace("\r\n", "\n") == "abc\n"
 

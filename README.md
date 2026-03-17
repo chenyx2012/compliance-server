@@ -143,17 +143,88 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 `POST /files/ingest`
 
-支持两种方式二选一：
+支持两种方式**二选一**（不能同时传）：
 
-- `source_url`：文件/压缩包 URL（支持 `github` / `gitee` / `gitcode` 的 `blob` 链接，服务端会自动转换为可下载的 raw 链接）
-- `file`：上传文件/压缩包（`zip` / `tar` / `tar.gz` / `tgz` 或普通文件）
+- **方式一：Git 仓库地址** — 表单字段 `source_url`：**带 .git 或不带均可**，例如 `https://github.com/owner/repo` 或 `https://github.com/owner/repo.git`。服务端通过 **git clone** 拉取代码后解析目录树（不下载压缩包）。
+- **方式二：本地上传** — 表单文件 `file`：压缩包（zip/tar/tar.gz/tgz）或单个文件。
 
-解析完成后会将 **目录树与 meta 写入 MySQL**（表 `file_ingest_result`），响应中带 `ingest_id`（主键）便于后续按 ID 查询。若配置了 **S3**（`S3_APP_TOKEN`、`S3_BUCKET_NAME` 等），解压后会调用 `s3_uploader.py` 将解压目录上传到 S3；上传失败时 `meta` 中会包含 `s3_upload_error`。
+解析完成后会将 **目录树与 meta 写入 MySQL**（表 `file_ingest_result`），响应中带 `ingest_id`（主键）。若配置了 S3，clone/解压后会上传至 S3；失败时 `meta.s3_upload_error` 有错误信息。
 
-返回字段：
+**前端调用说明**
 
-- `ok`, `ingest_id`, `meta`, `tree`
-- 树节点结构：`path`（节点路径）、`next`（子节点映射）、`content`（目录为 `null`；文件为 JSON，如 `{"text": "..."}` 或 `{"binary": true, "base64": "..."}`）
+- **接口地址**：`POST {网关基地址}/files/ingest`（例如 `http://localhost:8000/files/ingest`）
+- **Content-Type**：`multipart/form-data`（不要用 `application/json`）
+
+**方式一：通过 Git 仓库地址（git clone）**
+
+```http
+POST /files/ingest HTTP/1.1
+Host: localhost:8000
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW
+
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="source_url"
+
+https://github.com/owner/repo.git
+------WebKitFormBoundary7MA4YWxkTrZu0gW--
+```
+
+也可传不带 `.git` 的地址：`https://github.com/owner/repo`。
+
+**方式二：上传文件**
+
+```http
+POST /files/ingest HTTP/1.1
+Host: localhost:8000
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW
+
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="file"; filename="project.zip"
+Content-Type: application/zip
+
+<二进制文件内容>
+------WebKitFormBoundary7MA4YWxkTrZu0gW--
+```
+
+**前端代码示例（JavaScript / axios）**
+
+```javascript
+// 方式一：Git 仓库地址（带 .git 或不带均可）
+const formData = new FormData();
+formData.append("source_url", "https://github.com/owner/repo.git");
+
+const res = await fetch("http://localhost:8000/files/ingest", {
+  method: "POST",
+  body: formData,
+});
+const data = await res.json();
+// data.ok === true, data.ingest_id, data.meta.type === "git", data.tree
+```
+
+```javascript
+// 方式二：上传文件（input[type=file] 或 File 对象）
+const formData = new FormData();
+formData.append("file", file); // file 为 File 对象
+
+const res = await fetch("http://localhost:8000/files/ingest", {
+  method: "POST",
+  body: formData,
+});
+const data = await res.json();
+```
+
+**响应结构（200）**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `ok` | boolean | 是否成功 |
+| `ingest_id` | number | 入库主键，可用于后续查询 |
+| `meta` | object | 来源信息：`source`(url/upload)、`type`(git/archive/file)、`url`/`clone_url`/`filename` 等；若有 S3 上传失败则带 `s3_upload_error` |
+| `tree` | object | 目录树根节点：`path`、`next`（子节点名→节点）、`content`（叶子为 JSON 如 `{text, size_bytes}`，目录为 null） |
+
+**错误**
+
+- `400`：未传 `source_url` 也未传 `file`；或两者都传了；或 `source_url` 为压缩包/blob 地址（应传仓库根地址）；或 git clone 失败。响应体为 `{"detail": "..."}`。
 
 ## 下游服务约定（四模块通用）
 
