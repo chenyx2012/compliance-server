@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+import logging
 import posixpath
+import sys
 import tarfile
 import tempfile
 import zipfile
@@ -9,6 +12,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import httpx
+
+from app.core.config import settings
 
 
 DEFAULT_IGNORE_DIRS = {
@@ -108,6 +113,49 @@ def _pick_single_root(extract_dir: Path) -> Path:
     return extract_dir
 
 
+async def _upload_extracted_folder_to_s3(local_folder_absolute_path: Path) -> Optional[str]:
+    """
+    解压完成后调用 s3_uploader.py 将本地目录上传到 S3。
+    若未配置 S3_APP_TOKEN 或脚本不存在则跳过；失败时返回错误信息，成功返回 None。
+    """
+    if not (getattr(settings, "s3_app_token", None) and settings.s3_bucket_name):
+        return None
+    script_path = Path(settings.s3_uploader_script)
+    if not script_path.is_absolute():
+        project_root = Path(__file__).resolve().parent.parent.parent
+        script_path = project_root / settings.s3_uploader_script
+    if not script_path.exists():
+        logging.warning("S3 uploader script not found: %s, skip S3 upload", script_path)
+        return None
+    folder_str = str(local_folder_absolute_path.resolve())
+    cmd = [
+        sys.executable,
+        str(script_path),
+        f"--local_folder_absolute_path={folder_str}",
+        f"--app_token={settings.s3_app_token}",
+        f"--region={settings.s3_region}",
+        f"--bucket_name={settings.s3_bucket_name}",
+        f"--bucket_path={settings.s3_bucket_path}",
+        "--show_speed",
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(script_path.parent),
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
+        if proc.returncode != 0:
+            err = (stderr or stdout or b"").decode("utf-8", errors="replace").strip()
+            return err or f"exit code {proc.returncode}"
+        return None
+    except asyncio.TimeoutError:
+        return "S3 upload timeout (600s)"
+    except Exception as e:
+        return str(e)
+
+
 def _read_text_best_effort(path: Path, *, max_bytes: int) -> Dict[str, Any]:
     data = path.read_bytes()
     if len(data) > max_bytes:
@@ -191,16 +239,18 @@ async def ingest_from_url(url: str, *, timeout_seconds: float = 60.0) -> Tuple[D
         if _is_zip(tmp_file) or _is_tar(tmp_file):
             _extract_archive(tmp_file, td_path)
             root = _pick_single_root(td_path)
+            s3_err = await _upload_extracted_folder_to_s3(root)
             tree = build_dir_tree(root, display_root=root.name)
-            meta = {"source": "url", "url": url, "normalized_url": normalized, "type": "archive", "filename": filename}
+            meta = {"source": "url", "url": url, "normalized_url": normalized, "type": "archive", "filename": filename, "s3_upload": "Success" if s3_err is None else s3_err}
             return tree, meta
 
         single_root = td_path / "upload"
         single_root.mkdir(parents=True, exist_ok=True)
         dest = single_root / (filename or tmp_file.name)
         dest.write_bytes(tmp_file.read_bytes())
+        s3_err = await _upload_extracted_folder_to_s3(single_root)
         tree = build_dir_tree(single_root, display_root=single_root.name)
-        meta = {"source": "url", "url": url, "normalized_url": normalized, "type": "file", "filename": filename}
+        meta = {"source": "url", "url": url, "normalized_url": normalized, "type": "file", "filename": filename, "s3_upload": "Success" if s3_err is None else s3_err}
         return tree, meta
 
 
@@ -218,15 +268,17 @@ async def ingest_from_upload(
             extract_dir.mkdir(parents=True, exist_ok=True)
             _extract_archive(tmp, extract_dir)
             root = _pick_single_root(extract_dir)
+            s3_err = await _upload_extracted_folder_to_s3(root)
             tree = build_dir_tree(root, display_root=root.name)
-            meta = {"source": "upload", "type": "archive", "filename": uploaded_filename}
+            meta = {"source": "upload", "type": "archive", "filename": uploaded_filename, "s3_upload": "Success" if s3_err is None else s3_err}
             return tree, meta
 
         single_root = td_path / "upload"
         single_root.mkdir(parents=True, exist_ok=True)
         dest = single_root / (uploaded_filename or "file")
         dest.write_bytes(data)
+        s3_err = await _upload_extracted_folder_to_s3(single_root)
         tree = build_dir_tree(single_root, display_root=single_root.name)
-        meta = {"source": "upload", "type": "file", "filename": uploaded_filename}
+        meta = {"source": "upload", "type": "file", "filename": uploaded_filename, "s3_upload": "Success" if s3_err is None else s3_err}
         return tree, meta
 

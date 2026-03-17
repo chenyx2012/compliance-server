@@ -121,11 +121,14 @@ async def files_ingest(
 
     source_type = meta.get("source", "unknown")
     source_label = meta.get("url") or meta.get("filename") or ""
+    s3_status = meta.get("s3_upload", "Unknown")
     row = FileIngestResult(
         source_type=source_type,
         source_label=source_label[:512] if source_label else None,
         meta=meta,
         tree=tree,
+        s3_upload_status=s3_status,
+        status=1
     )
     db.add(row)
     await db.flush()

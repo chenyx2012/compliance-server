@@ -45,6 +45,13 @@ class Settings(BaseSettings):
     mysql_database: str = Field(default="compliance_gateway", alias="MYSQL_DATABASE")
     mysql_charset: str = Field(default="utf8mb4", alias="MYSQL_CHARSET")
 
+    # S3 上传（解压后调用 s3_uploader.py）；app_token 为空则不执行上传
+    s3_app_token: Optional[str] = Field(default=None, alias="S3_APP_TOKEN")
+    s3_region: str = Field(default="cn-east-3", alias="S3_REGION")
+    s3_bucket_name: str = Field(default="", alias="S3_BUCKET_NAME")
+    s3_bucket_path: str = Field(default="csv/", alias="S3_BUCKET_PATH")
+    s3_uploader_script: str = Field(default="s3_uploader.py", alias="S3_UPLOADER_SCRIPT")
+
     @property
     def database_url(self) -> str:
         """异步驱动 aiomysql，用于 SQLAlchemy create_async_engine。"""

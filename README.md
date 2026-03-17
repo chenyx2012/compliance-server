@@ -20,7 +20,7 @@
 
 ## 依赖
 
-- Python 3.10+
+- Python 3.10+  
 - Redis（用于队列与结果存储）
 - MySQL（用于文件目录树解析结果持久化；启动时若不可用仅打日志，不中断）
 
@@ -148,7 +148,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - `source_url`：文件/压缩包 URL（支持 `github` / `gitee` / `gitcode` 的 `blob` 链接，服务端会自动转换为可下载的 raw 链接）
 - `file`：上传文件/压缩包（`zip` / `tar` / `tar.gz` / `tgz` 或普通文件）
 
-解析完成后会将 **目录树与 meta 写入 MySQL**（表 `file_ingest_result`），响应中带 `ingest_id`（主键）便于后续按 ID 查询。
+解析完成后会将 **目录树与 meta 写入 MySQL**（表 `file_ingest_result`），响应中带 `ingest_id`（主键）便于后续按 ID 查询。若配置了 **S3**（`S3_APP_TOKEN`、`S3_BUCKET_NAME` 等），解压后会调用 `s3_uploader.py` 将解压目录上传到 S3；上传失败时 `meta` 中会包含 `s3_upload_error`。
 
 返回字段：
 

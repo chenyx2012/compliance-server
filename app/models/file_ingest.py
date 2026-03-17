@@ -33,7 +33,9 @@ class FileIngestResult(Base):
     meta: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False)
     # 完整目录树：{ path, next: { ... }, content: null | {...} }
     tree: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False)
+    s3_upload_status: Mapped[str] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utc_now, nullable=False)
+    status: Mapped[int] = mapped_column(Integer, default=0, nullable=False) # 0: pending, 1: success, 2: failed
 
     def __repr__(self) -> str:
         return f"<FileIngestResult(id={self.id}, source_type={self.source_type}, created_at={self.created_at})>"
