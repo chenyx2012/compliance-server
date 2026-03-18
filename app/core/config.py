@@ -52,6 +52,12 @@ class Settings(BaseSettings):
     s3_bucket_path: str = Field(default="csv/", alias="S3_BUCKET_PATH")
     s3_uploader_script: str = Field(default="s3_uploader.py", alias="S3_UPLOADER_SCRIPT")
 
+    # compliance-sentry-main 后端根地址（含 /api/v1 之前的部分），如 http://127.0.0.1:8000
+    compliance_sentry_base_url: str = Field(
+        default="http://127.0.0.1:8010",
+        alias="COMPLIANCE_SENTRY_BASE_URL",
+    )
+
     @property
     def database_url(self) -> str:
         """异步驱动 aiomysql，用于 SQLAlchemy create_async_engine。"""

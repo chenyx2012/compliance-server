@@ -14,9 +14,12 @@
 - `app/core/http_client.py`：下游 HTTP 调用（通用 POST JSON）
 - `app/services/tasks.py`：扫描编排与 Celery 任务（并发调用 A/B/C/D）
 - `app/services/file_ingest.py`：文件获取与目录树解析
+- `app/services/sentry_proxy.py`：compliance-sentry 请求透传
+- `app/routers/compliance_sentry.py`：compliance-sentry 全量接口路由
 - `app/schemas/scan.py`：扫描请求/响应模型
 - `app/core/database.py`：MySQL 异步连接与会话
 - `app/models/file_ingest.py`：文件解析结果表模型（目录树 + meta 入库）
+- `docs/compliance-sentry-api.md`：compliance-sentry 接口对接完整说明
 
 ## 依赖
 
@@ -225,6 +228,12 @@ const data = await res.json();
 **错误**
 
 - `400`：未传 `source_url` 也未传 `file`；或两者都传了；或 `source_url` 为压缩包/blob 地址（应传仓库根地址）；或 git clone 失败。响应体为 `{"detail": "..."}`。
+
+### 4) 平台任务总入口 & compliance-sentry 全量接口
+
+包括鉴权流程、`POST /platform/tasks`（文件入库 + 扫描触发）、异步任务轮询、以及 compliance-sentry 全部模块（analysis、mission、kb、dashboard、system、conflicts、task_assets 等）的代理接口说明，详见：
+
+**[docs/compliance-sentry-api.md](docs/compliance-sentry-api.md)**
 
 ## 下游服务约定（四模块通用）
 

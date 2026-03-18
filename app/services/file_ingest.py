@@ -231,10 +231,13 @@ async def ingest_from_url(
     - https://gitee.com/owner/repo.git
     """
     clone_url = normalize_git_clone_url(url)
+    # 从 URL 末段提取仓库名，去掉 .git 后缀，作为本地目录名
+    # 例：https://gitcode.com/openeuler/IB_Robot.git → IB_Robot
+    repo_name = url.rstrip("/").split("/")[-1].removesuffix(".git").strip() or "repo"
 
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
-        repo_root = td_path / "repo"
+        repo_root = td_path / repo_name
         await _clone_repo(clone_url, repo_root, timeout_seconds=timeout_seconds)
         s3_err = await _upload_extracted_folder_to_s3(repo_root)
         tree = build_dir_tree(repo_root, display_root=repo_root.name)
@@ -269,7 +272,9 @@ async def ingest_from_upload(
             meta = {"source": "upload", "type": "archive", "filename": uploaded_filename, "s3_upload": "Success" if s3_err is None else s3_err}
             return tree, meta
 
-        single_root = td_path / "upload"
+        # 用文件名（保留扩展名）作为根目录名，例：main.py → main.py
+        file_stem = uploaded_filename if uploaded_filename else "upload"
+        single_root = td_path / (file_stem or "upload")
         single_root.mkdir(parents=True, exist_ok=True)
         dest = single_root / (uploaded_filename or "file")
         dest.write_bytes(data)
