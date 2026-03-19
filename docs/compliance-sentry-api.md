@@ -23,48 +23,49 @@
 
 ## 鉴权流程
 
-compliance-sentry 使用 **JWT Bearer Token** 鉴权，所有需要登录的接口均要在请求头携带：
+**前端无需处理任何鉴权**。网关持有一个服务账号（配置在 `.env` 中），在调用 sentry 的每个接口前自动登录获取 token 并注入请求头，token 过期时自动刷新，对前端完全透明。
 
-```
-Authorization: Bearer <access_token>
-```
+### 配置服务账号（`.env`）
 
-网关会将该请求头**原样透传**给 sentry，无需在网关侧做任何额外处理。
-
-### 第一步：登录获取 Token
-
-```http
-POST /platform/compliance-sentry/v1/auth/login
-Content-Type: application/x-www-form-urlencoded
-
-username=admin&password=your_password
+```env
+COMPLIANCE_SENTRY_BASE_URL=http://127.0.0.1:8010
+COMPLIANCE_SENTRY_USERNAME=admin
+COMPLIANCE_SENTRY_PASSWORD=your_sentry_password
 ```
 
-> 注意：登录接口使用 `application/x-www-form-urlencoded`，不是 JSON。
+### 鉴权工作原理
 
-**响应：**
-
-```json
-{
-  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-  "token_type": "bearer"
-}
+```
+前端请求（无需 Authorization 头）
+        │
+        ▼
+网关 sentry_proxy.py
+        │  1. 调用 sentry_auth.get_token()
+        │     - 首次：用服务账号登录 sentry，缓存 token（25 分钟）
+        │     - token 快过期：自动预刷新
+        │  2. 注入 Authorization: Bearer <token>
+        │  3. 若 sentry 返回 401：强制刷新 token 后重试一次
+        ▼
+compliance-sentry-main（完成 JWT 校验）
 ```
 
-### 第二步：后续请求带 Token
+### 前端调用示例
+
+前端直接调用接口，**不需要**登录步骤，**不需要**传 Authorization 头：
 
 ```javascript
-// JavaScript 示例
-const loginRes = await fetch('/platform/compliance-sentry/v1/auth/login', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-  body: new URLSearchParams({ username: 'admin', password: 'your_password' })
-})
-const { access_token } = await loginRes.json()
+// 直接查询任务列表，无需任何鉴权处理
+const res = await fetch('/platform/compliance-sentry/v1/analysis/tasks')
+const data = await res.json()
 
-// 后续所有请求带上 Authorization 头
-const res = await fetch('/platform/compliance-sentry/v1/analysis/tasks', {
-  headers: { 'Authorization': `Bearer ${access_token}` }
+// 提交平台任务，同样无需 Authorization
+const form = new FormData()
+form.append('project_name', 'my-project')
+form.append('service', 'compliance-sentry')
+form.append('file', zipFile)
+const taskRes = await fetch('/platform/tasks', {
+  method: 'POST',
+  body: form
 })
 ```
 
@@ -76,7 +77,7 @@ const res = await fetch('/platform/compliance-sentry/v1/analysis/tasks', {
 
 **Content-Type**：`multipart/form-data`
 
-**请求头**：需携带 `Authorization: Bearer <token>`
+**请求头**：无需携带 `Authorization`，网关自动处理鉴权
 
 ### 请求参数
 
@@ -102,8 +103,7 @@ form.append('file', zipFile)  // File 对象
 
 const res = await fetch('/platform/tasks', {
   method: 'POST',
-  headers: { 'Authorization': `Bearer ${access_token}` },
-  body: form
+  body: form   // 无需 Authorization 头，网关自动鉴权
 })
 const data = await res.json()
 // data.ingest_id       — 目录树入库 ID
@@ -121,8 +121,7 @@ form.append('source_url', 'https://github.com/owner/repo.git')
 
 const res = await fetch('/platform/tasks', {
   method: 'POST',
-  headers: { 'Authorization': `Bearer ${access_token}` },
-  body: form
+  body: form   // 无需 Authorization 头，网关自动鉴权
 })
 const data = await res.json()
 // data.platform_task_id — 用于轮询的 Celery task ID

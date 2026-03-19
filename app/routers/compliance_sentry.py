@@ -39,6 +39,7 @@ from app.core.database import get_db
 from app.models.file_ingest import FileIngestResult
 from app.services.file_ingest import ingest_from_upload, ingest_from_url
 from app.services.platform_tasks import sentry_mission_task
+from app.services.sentry_auth import get_token
 from app.services.sentry_proxy import proxy_to_sentry
 
 router = APIRouter(tags=["compliance-sentry", "platform"])
@@ -613,7 +614,6 @@ async def compliance_sentry_proxy_fallback(path: str, request: Request):
     tags=["platform"],
 )
 async def platform_tasks(
-    request: Request,
     project_name: str = Form(..., description="任务/项目名称（提交 sentry 必填）"),
     service: str = Form(
         "none",
@@ -637,7 +637,6 @@ async def platform_tasks(
     if source_url and source_url.strip() and file is not None:
         raise HTTPException(status_code=400, detail="provide only one of source_url or file")
 
-    auth = request.headers.get("authorization") or ""
     file_bytes: Optional[bytes] = None
     upload_filename = ""
 
@@ -683,13 +682,19 @@ async def platform_tasks(
     if not settings.compliance_sentry_base_url:
         raise HTTPException(status_code=503, detail="COMPLIANCE_SENTRY_BASE_URL not configured")
 
+    # 自动获取 sentry token，前端无需传 Authorization
+    try:
+        token = await get_token()
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=f"sentry auth failed: {e}")
+    sentry_headers = {"Authorization": f"Bearer {token}"}
+
     if source_url and source_url.strip():
         if async_scan:
             ar = sentry_mission_task.apply_async(
                 kwargs={
                     "mode": "git",
                     "project_name": project_name,
-                    "authorization": auth,
                     "temp_path": None,
                     "git_url": source_url.strip(),
                     "third_party": third_party,
@@ -701,7 +706,6 @@ async def platform_tasks(
             out["platform_task_id"] = ar.id
             return out
         base = settings.compliance_sentry_base_url.rstrip("/") + "/api/v1"
-        headers = {"Authorization": auth} if auth else {}
         form_git = {
             "project_name": project_name,
             "git_url": source_url.strip(),
@@ -711,7 +715,7 @@ async def platform_tasks(
         if branch_tag:
             form_git["branch_tag"] = branch_tag
         async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
-            r = await client.post(f"{base}/mission/git", data=form_git, headers=headers)
+            r = await client.post(f"{base}/mission/git", data=form_git, headers=sentry_headers)
         try:
             sentry_body = r.json()
         except Exception:
@@ -737,7 +741,6 @@ async def platform_tasks(
             kwargs={
                 "mode": "upload",
                 "project_name": project_name,
-                "authorization": auth,
                 "temp_path": tmp,
                 "git_url": None,
                 "third_party": third_party,
@@ -750,7 +753,6 @@ async def platform_tasks(
         return out
 
     base = settings.compliance_sentry_base_url.rstrip("/") + "/api/v1"
-    headers = {"Authorization": auth} if auth else {}
     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
         files = {"file": (upload_filename or "upload.zip", file_bytes, "application/zip")}
         form = {
@@ -758,7 +760,7 @@ async def platform_tasks(
             "third_party": str(third_party).lower(),
             "fallback_tree": str(fallback_tree).lower(),
         }
-        r = await client.post(f"{base}/mission/upload", files=files, data=form, headers=headers)
+        r = await client.post(f"{base}/mission/upload", files=files, data=form, headers=sentry_headers)
     try:
         sentry_body = r.json()
     except Exception:

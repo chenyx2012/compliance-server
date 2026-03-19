@@ -52,10 +52,19 @@ class Settings(BaseSettings):
     s3_bucket_path: str = Field(default="csv/", alias="S3_BUCKET_PATH")
     s3_uploader_script: str = Field(default="s3_uploader.py", alias="S3_UPLOADER_SCRIPT")
 
-    # compliance-sentry-main 后端根地址（含 /api/v1 之前的部分），如 http://127.0.0.1:8000
+    # compliance-sentry-main 后端根地址（含 /api/v1 之前的部分），如 http://127.0.0.1:8010
     compliance_sentry_base_url: str = Field(
         default="http://127.0.0.1:8010",
         alias="COMPLIANCE_SENTRY_BASE_URL",
+    )
+    # 网关代表前端自动登录 sentry 所用的服务账号（前端无需传 token）
+    compliance_sentry_username: str = Field(
+        default="admin",
+        alias="COMPLIANCE_SENTRY_USERNAME",
+    )
+    compliance_sentry_password: str = Field(
+        default="",
+        alias="COMPLIANCE_SENTRY_PASSWORD",
     )
 
     @property
