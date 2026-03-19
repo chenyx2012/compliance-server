@@ -42,17 +42,43 @@ async def _do_login() -> tuple[str, float]:
         "username": settings.compliance_sentry_username,
         "password": settings.compliance_sentry_password,
     }
-    logger.info("sentry_auth: logging in as '%s'", settings.compliance_sentry_username)
-    async with httpx.AsyncClient(timeout=_LOGIN_TIMEOUT) as client:
-        r = await client.post(url, data=payload)
+    logger.info("sentry_auth: logging in — url=%s username=%s", url, settings.compliance_sentry_username)
+    try:
+        async with httpx.AsyncClient(timeout=_LOGIN_TIMEOUT) as client:
+            r = await client.post(url, data=payload)
+    except httpx.ConnectTimeout:
+        logger.error("sentry_auth: connect timeout — url=%s (connect limit %.1fs)", url, _LOGIN_TIMEOUT.connect)
+        raise RuntimeError(f"sentry login connect timeout: {url}")
+    except httpx.ConnectError as e:
+        logger.error("sentry_auth: connect error — url=%s error=%s", url, e)
+        raise RuntimeError(f"sentry login connect error ({url}): {e}")
+    except httpx.ReadTimeout:
+        logger.error("sentry_auth: read timeout — url=%s (read limit %.1fs)", url, _LOGIN_TIMEOUT.read)
+        raise RuntimeError(f"sentry login read timeout: {url}")
+    except httpx.RequestError as e:
+        logger.error("sentry_auth: request error — url=%s error=%s", url, e)
+        raise RuntimeError(f"sentry login request error ({url}): {e}")
+
     if not r.is_success:
+        logger.error(
+            "sentry_auth: login failed — url=%s HTTP %s body=%s",
+            url, r.status_code, r.text[:500],
+        )
         raise RuntimeError(
             f"sentry login failed: HTTP {r.status_code} — {r.text[:300]}"
         )
-    body = r.json()
+
+    try:
+        body = r.json()
+    except Exception as e:
+        logger.error("sentry_auth: failed to parse login response — %s — body=%s", e, r.text[:300])
+        raise RuntimeError(f"sentry login response is not valid JSON: {e}")
+
     token = body.get("access_token") or body.get("token")
     if not token:
+        logger.error("sentry_auth: no token in response — body=%s", body)
         raise RuntimeError(f"sentry login response missing access_token: {body}")
+
     expires_in: float = float(body.get("expires_in") or 25 * 60)
     logger.info("sentry_auth: login successful, token expires in %.0fs", expires_in)
     return token, expires_in
