@@ -30,7 +30,8 @@ def _get_token_sync() -> str:
         "username": settings.compliance_sentry_username,
         "password": settings.compliance_sentry_password,
     }
-    r = httpx.post(url, data=payload, timeout=30.0)
+    _proxy = settings.compliance_sentry_proxy or None
+    r = httpx.post(url, data=payload, timeout=30.0, proxy=_proxy)
     if not r.is_success:
         raise RuntimeError(f"sentry login failed: HTTP {r.status_code} — {r.text[:300]}")
     body = r.json()
@@ -66,6 +67,7 @@ def sentry_mission_task(
 
     headers: Dict[str, str] = {"Authorization": f"Bearer {token}"}
 
+    _proxy = settings.compliance_sentry_proxy or None
     try:
         if mode == "upload":
             if not temp_path or not os.path.isfile(temp_path):
@@ -83,6 +85,7 @@ def sentry_mission_task(
                     data=data,
                     headers=headers,
                     timeout=600.0,
+                    proxy=_proxy,
                 )
         elif mode == "git":
             if not git_url:
@@ -100,6 +103,7 @@ def sentry_mission_task(
                 data=data,
                 headers=headers,
                 timeout=600.0,
+                proxy=_proxy,
             )
         else:
             return {"ok": False, "error": f"unknown mode: {mode}"}

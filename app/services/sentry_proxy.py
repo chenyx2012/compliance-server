@@ -17,6 +17,7 @@ from typing import Dict
 import httpx
 from fastapi import Request, Response
 
+from app.core.config import settings
 from app.services.sentry_auth import get_auth_header, get_token
 
 logger = logging.getLogger(__name__)
@@ -77,12 +78,13 @@ async def proxy_to_sentry(base_url: str, path: str, request: Request) -> Respons
     body = await request.body()
     base_headers = _forward_headers(request)
     timeout = httpx.Timeout(read=120.0, connect=10.0, write=30.0, pool=10.0)
+    proxy = settings.compliance_sentry_proxy or None
 
     logger.debug("proxy → %s %s", request.method, url)
 
     try:
         token = await get_token()
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, proxy=proxy) as client:
             r = await _do_request(client, request.method, url, body, base_headers, token)
 
             # sentry 返回 401：token 可能已失效，强制刷新后重试一次
@@ -129,4 +131,67 @@ async def proxy_to_sentry(base_url: str, path: str, request: Request) -> Respons
             out_headers[k] = r.headers[k]
 
     logger.debug("proxy ← %s %s", r.status_code, url)
+    return Response(content=r.content, status_code=r.status_code, headers=out_headers)
+
+
+async def proxy_to_sentry_noauth(base_url: str, path: str, request: Request) -> Response:
+    """
+    透传请求到 sentry，不注入网关服务账号 token。
+
+    适用于 auth 类接口（login / register / change-password），
+    前端自行携带凭据或 Authorization 头，网关仅做透传。
+    """
+    base = base_url.rstrip("/")
+    url = f"{base}/api/v1/{path}"
+    query = str(request.url.query)
+    if query:
+        url = f"{url}?{query}"
+
+    body = await request.body()
+    # auth 接口允许透传前端的 Authorization 头（如 change-password 需要已登录 token）
+    skip = {"host", "content-length", "connection", "transfer-encoding"}
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in skip}
+    timeout = httpx.Timeout(read=30.0, connect=10.0, write=10.0, pool=10.0)
+    proxy = settings.compliance_sentry_proxy or None
+
+    logger.debug("proxy(noauth) → %s %s", request.method, url)
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, proxy=proxy) as client:
+            r = await client.request(
+                request.method,
+                url,
+                content=body if body else None,
+                headers=headers,
+            )
+    except httpx.ConnectTimeout:
+        logger.warning("proxy(noauth) connect timeout: %s", url)
+        return _error_response(
+            503,
+            "sentry_connect_timeout",
+            f"无法连接到 compliance-sentry（{base_url}），请确认服务已启动且 COMPLIANCE_SENTRY_BASE_URL 配置正确",
+        )
+    except httpx.ConnectError as e:
+        logger.warning("proxy(noauth) connect error: %s — %s", url, e)
+        return _error_response(
+            503,
+            "sentry_connect_error",
+            f"连接 compliance-sentry 失败（{base_url}）：{e}，请检查服务是否运行、端口是否正确",
+        )
+    except httpx.ReadTimeout:
+        logger.warning("proxy(noauth) read timeout: %s", url)
+        return _error_response(504, "sentry_read_timeout", f"compliance-sentry 响应超时（{url}）")
+    except httpx.TimeoutException as e:
+        logger.warning("proxy(noauth) timeout: %s — %s", url, e)
+        return _error_response(504, "sentry_timeout", str(e))
+    except httpx.RequestError as e:
+        logger.error("proxy(noauth) request error: %s — %s", url, e)
+        return _error_response(502, "sentry_request_error", str(e))
+
+    out_headers: Dict[str, str] = {}
+    for k in ("content-type", "content-disposition"):
+        if k in r.headers:
+            out_headers[k] = r.headers[k]
+
+    logger.debug("proxy(noauth) ← %s %s", r.status_code, url)
     return Response(content=r.content, status_code=r.status_code, headers=out_headers)

@@ -44,7 +44,7 @@ async def _do_login() -> tuple[str, float]:
     }
     logger.info("sentry_auth: logging in — url=%s username=%s", url, settings.compliance_sentry_username)
     try:
-        async with httpx.AsyncClient(timeout=_LOGIN_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=_LOGIN_TIMEOUT, proxy=settings.compliance_sentry_proxy or None) as client:
             r = await client.post(url, data=payload)
     except httpx.ConnectTimeout:
         logger.error("sentry_auth: connect timeout — url=%s (connect limit %.1fs)", url, _LOGIN_TIMEOUT.connect)

@@ -714,7 +714,8 @@ async def platform_tasks(
         }
         if branch_tag:
             form_git["branch_tag"] = branch_tag
-        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
+        _proxy = settings.compliance_sentry_proxy or None
+        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0), proxy=_proxy) as client:
             r = await client.post(f"{base}/mission/git", data=form_git, headers=sentry_headers)
         try:
             sentry_body = r.json()
@@ -753,7 +754,8 @@ async def platform_tasks(
         return out
 
     base = settings.compliance_sentry_base_url.rstrip("/") + "/api/v1"
-    async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
+    _proxy = settings.compliance_sentry_proxy or None
+    async with httpx.AsyncClient(timeout=httpx.Timeout(600.0), proxy=_proxy) as client:
         files = {"file": (upload_filename or "upload.zip", file_bytes, "application/zip")}
         form = {
             "project_name": project_name,

@@ -54,7 +54,7 @@ class Settings(BaseSettings):
 
     # compliance-sentry-main 后端根地址（含 /api/v1 之前的部分），如 http://127.0.0.1:8010
     compliance_sentry_base_url: str = Field(
-        default="http://127.0.0.1:8010",
+        default="http://127.0.0.1:3010",
         alias="COMPLIANCE_SENTRY_BASE_URL",
     )
     # 网关代表前端自动登录 sentry 所用的服务账号（前端无需传 token）
@@ -65,6 +65,11 @@ class Settings(BaseSettings):
     compliance_sentry_password: str = Field(
         default="",
         alias="COMPLIANCE_SENTRY_PASSWORD",
+    )
+    # 访问 sentry 时使用的 HTTP 代理（如 http://127.0.0.1:7890），留空则直连
+    compliance_sentry_proxy: str = Field(
+        default="",
+        alias="COMPLIANCE_SENTRY_PROXY",
     )
 
     @property

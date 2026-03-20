@@ -6,6 +6,7 @@ venv/
 env/
 ENV/
 virtualenv/
+.env
 
 # ========================================
 # Python 编译文件
