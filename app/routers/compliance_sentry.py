@@ -23,6 +23,7 @@ compliance-sentry-main 全量接口对接路由。
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -40,8 +41,9 @@ from app.models.file_ingest import FileIngestResult
 from app.services.file_ingest import ingest_from_upload, ingest_from_url
 from app.services.platform_tasks import sentry_mission_task
 from app.services.sentry_auth import get_token
-from app.services.sentry_proxy import proxy_to_sentry
+from app.services.sentry_proxy import proxy_to_sentry, proxy_to_sentry_noauth
 
+logger = logging.getLogger(__name__)
 router = APIRouter(tags=["compliance-sentry", "platform"])
 
 # ---------------------------------------------------------------------------
@@ -632,6 +634,11 @@ async def platform_tasks(
     1. 根据 file 或 source_url 拉取代码并解析目录树，写入 MySQL（ingest_id）；
     2. 若 service=compliance-sentry：再向 sentry 提交 mission/upload（zip）或 mission/git（仓库地址）。
     """
+    logger.info(
+        "platform_tasks start — project_name=%s service=%s async_scan=%s source_url=%s file=%s",
+        project_name, service, async_scan, source_url, file.filename if file else None
+    )
+    
     if (not source_url or not source_url.strip()) and file is None:
         raise HTTPException(status_code=400, detail="provide source_url (git) or file")
     if source_url and source_url.strip() and file is not None:
@@ -666,6 +673,11 @@ async def platform_tasks(
     db.add(row)
     await db.flush()
     ingest_id = row.id
+    
+    logger.info(
+        "platform_tasks — ingest complete — ingest_id=%d source_type=%s source_label=%s s3_status=%s",
+        ingest_id, source_type, source_label[:50] if source_label else "N/A", s3_status
+    )
 
     out: Dict[str, Any] = {
         "ok": True,
@@ -677,15 +689,19 @@ async def platform_tasks(
 
     svc = (service or "none").strip().lower()
     if svc != "compliance-sentry":
+        logger.info("platform_tasks complete (no sentry) — ingest_id=%d service=%s", ingest_id, svc)
         return out
 
     if not settings.compliance_sentry_base_url:
         raise HTTPException(status_code=503, detail="COMPLIANCE_SENTRY_BASE_URL not configured")
+    
+    logger.info("platform_tasks — submitting to sentry — ingest_id=%d async=%s", ingest_id, async_scan)
 
     # 自动获取 sentry token，前端无需传 Authorization
     try:
         token = await get_token()
     except RuntimeError as e:
+        logger.error("platform_tasks — sentry auth failed — ingest_id=%d error=%s", ingest_id, e)
         raise HTTPException(status_code=503, detail=f"sentry auth failed: {e}")
     sentry_headers = {"Authorization": f"Bearer {token}"}
 
@@ -704,6 +720,10 @@ async def platform_tasks(
             )
             out["sentry_async"] = True
             out["platform_task_id"] = ar.id
+            logger.info(
+                "platform_tasks — submitted to sentry async (git) — ingest_id=%d celery_task_id=%s git_url=%s",
+                ingest_id, ar.id, source_url.strip()
+            )
             return out
         base = settings.compliance_sentry_base_url.rstrip("/") + "/api/v1"
         form_git = {
@@ -724,6 +744,15 @@ async def platform_tasks(
         out["sentry"] = {"status_code": r.status_code, "body": sentry_body}
         if not r.is_success:
             out["ok"] = False
+            logger.error(
+                "platform_tasks — sentry sync failed (git) — ingest_id=%d status=%d body=%s",
+                ingest_id, r.status_code, str(sentry_body)[:300]
+            )
+        else:
+            logger.info(
+                "platform_tasks — sentry sync success (git) — ingest_id=%d analysis_id=%s",
+                ingest_id, sentry_body.get("analysis_id", "N/A")
+            )
         return out
 
     # file path — need zip for mission/upload
@@ -751,6 +780,10 @@ async def platform_tasks(
         )
         out["sentry_async"] = True
         out["platform_task_id"] = ar.id
+        logger.info(
+            "platform_tasks — submitted to sentry async (upload) — ingest_id=%d celery_task_id=%s file=%s",
+            ingest_id, ar.id, upload_filename
+        )
         return out
 
     base = settings.compliance_sentry_base_url.rstrip("/") + "/api/v1"
@@ -770,6 +803,15 @@ async def platform_tasks(
     out["sentry"] = {"status_code": r.status_code, "body": sentry_body}
     if not r.is_success:
         out["ok"] = False
+        logger.error(
+            "platform_tasks — sentry sync failed (upload) — ingest_id=%d status=%d body=%s",
+            ingest_id, r.status_code, str(sentry_body)[:300]
+        )
+    else:
+        logger.info(
+            "platform_tasks — sentry sync success (upload) — ingest_id=%d analysis_id=%s",
+            ingest_id, sentry_body.get("analysis_id", "N/A")
+        )
     return out
 
 

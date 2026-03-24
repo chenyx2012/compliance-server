@@ -80,7 +80,7 @@ async def proxy_to_sentry(base_url: str, path: str, request: Request) -> Respons
     timeout = httpx.Timeout(read=120.0, connect=10.0, write=30.0, pool=10.0)
     proxy = settings.compliance_sentry_proxy or None
 
-    logger.debug("proxy → %s %s", request.method, url)
+    logger.info("proxy → %s %s (content_length=%d)", request.method, url, len(body))
 
     try:
         token = await get_token()
@@ -89,7 +89,7 @@ async def proxy_to_sentry(base_url: str, path: str, request: Request) -> Respons
 
             # sentry 返回 401：token 可能已失效，强制刷新后重试一次
             if r.status_code == 401:
-                logger.info("proxy got 401, refreshing token and retrying: %s", url)
+                logger.warning("proxy got 401, refreshing token and retrying: %s", url)
                 token = await get_token(force_refresh=True)
                 r = await _do_request(client, request.method, url, body, base_headers, token)
 
@@ -130,7 +130,7 @@ async def proxy_to_sentry(base_url: str, path: str, request: Request) -> Respons
         if k in r.headers:
             out_headers[k] = r.headers[k]
 
-    logger.debug("proxy ← %s %s", r.status_code, url)
+    logger.info("proxy ← %s %s (status=%d content_length=%d)", request.method, url, r.status_code, len(r.content))
     return Response(content=r.content, status_code=r.status_code, headers=out_headers)
 
 
@@ -154,7 +154,7 @@ async def proxy_to_sentry_noauth(base_url: str, path: str, request: Request) -> 
     timeout = httpx.Timeout(read=30.0, connect=10.0, write=10.0, pool=10.0)
     proxy = settings.compliance_sentry_proxy or None
 
-    logger.debug("proxy(noauth) → %s %s", request.method, url)
+    logger.info("proxy(noauth) → %s %s (content_length=%d)", request.method, url, len(body))
 
     try:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, proxy=proxy) as client:
@@ -193,5 +193,5 @@ async def proxy_to_sentry_noauth(base_url: str, path: str, request: Request) -> 
         if k in r.headers:
             out_headers[k] = r.headers[k]
 
-    logger.debug("proxy(noauth) ← %s %s", r.status_code, url)
+    logger.info("proxy(noauth) ← %s %s (status=%d content_length=%d)", request.method, url, r.status_code, len(r.content))
     return Response(content=r.content, status_code=r.status_code, headers=out_headers)

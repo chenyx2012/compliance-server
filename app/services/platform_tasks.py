@@ -30,14 +30,18 @@ def _get_token_sync() -> str:
         "username": settings.compliance_sentry_username,
         "password": settings.compliance_sentry_password,
     }
+    logger.info("_get_token_sync — url=%s username=%s", url, settings.compliance_sentry_username)
     _proxy = settings.compliance_sentry_proxy or None
     r = httpx.post(url, data=payload, timeout=30.0, proxy=_proxy)
     if not r.is_success:
+        logger.error("_get_token_sync failed — url=%s status=%d body=%s", url, r.status_code, r.text[:300])
         raise RuntimeError(f"sentry login failed: HTTP {r.status_code} — {r.text[:300]}")
     body = r.json()
     token = body.get("access_token") or body.get("token")
     if not token:
+        logger.error("_get_token_sync — no token in response — body=%s", body)
         raise RuntimeError(f"sentry login response missing access_token: {body}")
+    logger.info("_get_token_sync success — token_prefix=%s...", token[:20])
     return token
 
 
@@ -57,12 +61,18 @@ def sentry_mission_task(
     upload 时 temp_path 为本地 zip 路径，任务结束后删除。
     token 由网关服务账号自动获取，无需前端传入。
     """
+    task_id = self.request.id
+    logger.info(
+        "sentry_mission_task start — task_id=%s mode=%s project_name=%s git_url=%s temp_path=%s",
+        task_id, mode, project_name, git_url, temp_path
+    )
+    
     base = settings.compliance_sentry_base_url.rstrip("/") + "/api/v1"
 
     try:
         token = _get_token_sync()
     except RuntimeError as e:
-        logger.error("sentry_mission_task: auth failed — %s", e)
+        logger.error("sentry_mission_task auth failed — task_id=%s error=%s", task_id, e)
         return {"ok": False, "error": f"sentry auth failed: {e}"}
 
     headers: Dict[str, str] = {"Authorization": f"Bearer {token}"}
@@ -71,7 +81,12 @@ def sentry_mission_task(
     try:
         if mode == "upload":
             if not temp_path or not os.path.isfile(temp_path):
+                logger.error("sentry_mission_task — missing temp file — task_id=%s temp_path=%s", task_id, temp_path)
                 return {"ok": False, "error": "missing temp file for upload"}
+            
+            logger.info("sentry_mission_task — uploading file — task_id=%s file=%s size=%d bytes", 
+                       task_id, os.path.basename(temp_path), os.path.getsize(temp_path))
+            
             with open(temp_path, "rb") as f:
                 files = {"file": (os.path.basename(temp_path), f, "application/zip")}
                 data = {
@@ -89,7 +104,11 @@ def sentry_mission_task(
                 )
         elif mode == "git":
             if not git_url:
+                logger.error("sentry_mission_task — missing git_url — task_id=%s", task_id)
                 return {"ok": False, "error": "missing git_url"}
+            
+            logger.info("sentry_mission_task — submitting git — task_id=%s git_url=%s", task_id, git_url)
+            
             data: Dict[str, Any] = {
                 "project_name": project_name,
                 "git_url": git_url,
@@ -106,21 +125,35 @@ def sentry_mission_task(
                 proxy=_proxy,
             )
         else:
+            logger.error("sentry_mission_task — unknown mode — task_id=%s mode=%s", task_id, mode)
             return {"ok": False, "error": f"unknown mode: {mode}"}
 
         try:
             body = r.json()
         except Exception:
             body = {"raw": r.text[:2000]}
+        
         if r.is_success:
+            logger.info(
+                "sentry_mission_task success — task_id=%s mode=%s status=%d analysis_id=%s",
+                task_id, mode, r.status_code, body.get("analysis_id", "N/A")
+            )
             return {"ok": True, "status_code": r.status_code, "sentry": body}
+        
+        logger.error(
+            "sentry_mission_task failed — task_id=%s mode=%s status=%d body=%s",
+            task_id, mode, r.status_code, str(body)[:500]
+        )
         return {"ok": False, "status_code": r.status_code, "error": body}
 
     except Exception as e:
+        logger.error("sentry_mission_task exception — task_id=%s mode=%s error=%s", task_id, mode, str(e))
         return {"ok": False, "error": str(e)}
     finally:
         if temp_path and os.path.isfile(temp_path):
             try:
                 os.unlink(temp_path)
-            except OSError:
-                pass
+                logger.info("sentry_mission_task — temp file deleted — task_id=%s path=%s", task_id, temp_path)
+            except OSError as e:
+                logger.warning("sentry_mission_task — failed to delete temp file — task_id=%s path=%s error=%s", 
+                              task_id, temp_path, e)

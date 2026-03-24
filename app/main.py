@@ -11,10 +11,13 @@ from __future__ import annotations
 """
 
 from contextlib import asynccontextmanager
+import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from celery.result import AsyncResult
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.celery_app import celery_app
@@ -26,6 +29,8 @@ from app.routers import compliance_sentry
 from app.services.file_ingest import ingest_from_upload, ingest_from_url
 from app.services.tasks import MODULES, _run_scan_async, scan_task
 
+logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -36,6 +41,38 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
 app.include_router(compliance_sentry.router)
+
+
+# 请求日志中间件
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """记录所有 HTTP 请求的基本信息与耗时。"""
+    start_time = time.time()
+    
+    # 记录请求开始
+    logger.info(
+        "request start — method=%s path=%s client=%s",
+        request.method,
+        request.url.path,
+        request.client.host if request.client else "unknown"
+    )
+    
+    # 执行请求
+    response = await call_next(request)
+    
+    # 计算耗时
+    duration_ms = (time.time() - start_time) * 1000
+    
+    # 记录请求完成
+    logger.info(
+        "request complete — method=%s path=%s status=%d duration=%.2fms",
+        request.method,
+        request.url.path,
+        response.status_code,
+        duration_ms
+    )
+    
+    return response
 
 
 def _normalize_modules(modules: Optional[List[str]]) -> Optional[List[str]]:

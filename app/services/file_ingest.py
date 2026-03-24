@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 from app.core.config import settings
 
+logger = logging.getLogger(__name__)
 
 DEFAULT_IGNORE_DIRS = {
     ".git",
@@ -53,6 +54,7 @@ async def _clone_repo(git_url: str, dest_dir: Path, *, timeout_seconds: int = 30
     将 git 仓库 clone 到 dest_dir，返回仓库根目录（即 dest_dir 本身）。
     git_url 支持带 .git 和不带两种；使用浅克隆 --depth 1。
     """
+    logger.info("git clone start — url=%s dest=%s timeout=%ds", git_url, dest_dir, timeout_seconds)
     dest_dir.mkdir(parents=True, exist_ok=True)
     cmd = ["git", "clone", "--depth", "1", "--single-branch", git_url, str(dest_dir)]
     proc = await asyncio.create_subprocess_exec(
@@ -63,12 +65,17 @@ async def _clone_repo(git_url: str, dest_dir: Path, *, timeout_seconds: int = 30
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
     except asyncio.TimeoutError:
+        logger.error("git clone timeout — url=%s timeout=%ds", git_url, timeout_seconds)
         proc.kill()
         await proc.wait()
         raise ValueError("git clone timeout")
+    
     if proc.returncode != 0:
         err = (stderr or stdout or b"").decode("utf-8", errors="replace").strip()
+        logger.error("git clone failed — url=%s returncode=%d stderr=%s", git_url, proc.returncode, err[:500])
         raise ValueError(f"git clone failed: {err}")
+    
+    logger.info("git clone success — url=%s dest=%s", git_url, dest_dir)
     return dest_dir
 
 
@@ -84,14 +91,18 @@ def _is_tar(path: Path) -> bool:
 
 
 def _extract_archive(archive_path: Path, dest_dir: Path) -> None:
+    logger.info("extract archive start — archive=%s dest=%s", archive_path.name, dest_dir)
     if _is_zip(archive_path):
         with zipfile.ZipFile(archive_path, "r") as zf:
             zf.extractall(dest_dir)
+        logger.info("extract archive success (zip) — archive=%s", archive_path.name)
         return
     if _is_tar(archive_path):
         with tarfile.open(archive_path, "r:*") as tf:
             tf.extractall(dest_dir)
+        logger.info("extract archive success (tar) — archive=%s", archive_path.name)
         return
+    logger.error("extract archive failed — unsupported format — archive=%s", archive_path.name)
     raise ValueError("unsupported archive format")
 
 
@@ -106,16 +117,21 @@ async def _upload_extracted_folder_to_s3(local_folder_absolute_path: Path) -> Op
     """
     解压完成后调用 s3_uploader.py 将本地目录上传到 S3。
     若未配置 S3_APP_TOKEN 或脚本不存在则跳过；失败时返回错误信息，成功返回 None。
+    S3 上传过程的标准输出与标准错误会实时打印到日志。
     """
     if not (getattr(settings, "s3_app_token", None) and settings.s3_bucket_name):
+        logger.info("s3 upload skip — S3_APP_TOKEN or S3_BUCKET_NAME not configured")
         return None
+    
     script_path = Path(settings.s3_uploader_script)
     if not script_path.is_absolute():
         project_root = Path(__file__).resolve().parent.parent.parent
         script_path = project_root / settings.s3_uploader_script
+    
     if not script_path.exists():
-        logging.warning("S3 uploader script not found: %s, skip S3 upload", script_path)
+        logger.warning("s3 upload skip — script not found — path=%s", script_path)
         return None
+    
     folder_str = str(local_folder_absolute_path.resolve())
     cmd = [
         sys.executable,
@@ -127,21 +143,55 @@ async def _upload_extracted_folder_to_s3(local_folder_absolute_path: Path) -> Op
         f"--bucket_path={settings.s3_bucket_path}",
         "--show_speed",
     ]
+    
+    logger.info(
+        "s3 upload start — folder=%s bucket=%s/%s region=%s",
+        local_folder_absolute_path.name,
+        settings.s3_bucket_name,
+        settings.s3_bucket_path,
+        settings.s3_region,
+    )
+    
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,  # 合并 stderr 到 stdout
             cwd=str(script_path.parent),
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
+        
+        # 实时读取并记录 S3 上传脚本的输出
+        assert proc.stdout is not None
+        line_count = 0
+        while True:
+            line_bytes = await proc.stdout.readline()
+            if not line_bytes:
+                break
+            line = line_bytes.decode("utf-8", errors="replace").rstrip()
+            if line:
+                line_count += 1
+                # 输出格式：[s3_uploader] <原始输出>
+                logger.info("[s3_uploader] %s", line)
+        
+        await asyncio.wait_for(proc.wait(), timeout=600)
+        
         if proc.returncode != 0:
-            err = (stderr or stdout or b"").decode("utf-8", errors="replace").strip()
-            return err or f"exit code {proc.returncode}"
+            logger.error(
+                "s3 upload failed — folder=%s returncode=%d total_output_lines=%d",
+                local_folder_absolute_path.name,
+                proc.returncode,
+                line_count,
+            )
+            return f"S3 upload failed with exit code {proc.returncode}"
+        
+        logger.info("s3 upload success — folder=%s total_output_lines=%d", local_folder_absolute_path.name, line_count)
         return None
+        
     except asyncio.TimeoutError:
+        logger.error("s3 upload timeout — folder=%s timeout=600s", local_folder_absolute_path.name)
         return "S3 upload timeout (600s)"
     except Exception as e:
+        logger.error("s3 upload exception — folder=%s error=%s", local_folder_absolute_path.name, str(e))
         return str(e)
 
 
@@ -177,12 +227,15 @@ def build_dir_tree(
 ) -> Dict[str, Any]:
     ignore_dirs = ignore_dirs or DEFAULT_IGNORE_DIRS
     root_dir = root_dir.resolve()
+    logger.info("build_dir_tree start — root=%s display_root=%s", root_dir, display_root or "(auto)")
 
     def make_node(path_str: str) -> Dict[str, Any]:
         return {"path": path_str, "next": {}, "content": None}
 
     root_node = make_node(display_root or root_dir.name or ".")
     nodes: Dict[str, Dict[str, Any]] = {"": root_node}
+    file_count = 0
+    dir_count = 0
 
     for p in _iter_paths(root_dir):
         rel = p.relative_to(root_dir)
@@ -203,6 +256,7 @@ def build_dir_tree(
                 if nxt not in nodes:
                     nodes[nxt] = make_node(nxt)
                     nodes[cur]["next"][part] = nodes[nxt]
+                    dir_count += 1
                 cur = nxt
             parent = nodes[parent_rel]
 
@@ -214,7 +268,9 @@ def build_dir_tree(
         if p.is_file():
             nodes[rel_posix]["content"] = _read_text_best_effort(p, max_bytes=max_file_bytes)
             nodes[rel_posix]["next"] = {}
+            file_count += 1
 
+    logger.info("build_dir_tree success — root=%s files=%d dirs=%d", root_dir, file_count, dir_count)
     return root_node
 
 
@@ -230,6 +286,7 @@ async def ingest_from_url(
     - https://github.com/owner/repo.git
     - https://gitee.com/owner/repo.git
     """
+    logger.info("ingest_from_url start — url=%s", url)
     clone_url = normalize_git_clone_url(url)
     # 从 URL 末段提取仓库名，去掉 .git 后缀，作为本地目录名
     # 例：https://gitcode.com/openeuler/IB_Robot.git → IB_Robot
@@ -250,6 +307,9 @@ async def ingest_from_url(
         }
         if s3_err:
             meta["s3_upload_error"] = s3_err
+            logger.warning("ingest_from_url complete (S3 failed) — url=%s s3_error=%s", url, s3_err[:200])
+        else:
+            logger.info("ingest_from_url success — url=%s", url)
         return tree, meta
 
 
@@ -257,12 +317,15 @@ async def ingest_from_upload(
     uploaded_filename: str,
     data: bytes,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    logger.info("ingest_from_upload start — filename=%s size=%d bytes", uploaded_filename, len(data))
+    
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
         tmp = td_path / (uploaded_filename or "upload.bin")
         tmp.write_bytes(data)
 
         if _is_zip(tmp) or _is_tar(tmp): 
+            logger.info("ingest_from_upload — detected archive — filename=%s", uploaded_filename)
             extract_dir = td_path / "extract"
             extract_dir.mkdir(parents=True, exist_ok=True)
             _extract_archive(tmp, extract_dir)
@@ -270,9 +333,14 @@ async def ingest_from_upload(
             s3_err = await _upload_extracted_folder_to_s3(root)
             tree = build_dir_tree(root, display_root=root.name)
             meta = {"source": "upload", "type": "archive", "filename": uploaded_filename, "s3_upload": "Success" if s3_err is None else s3_err}
+            if s3_err:
+                logger.warning("ingest_from_upload complete (S3 failed) — filename=%s type=archive s3_error=%s", uploaded_filename, s3_err[:200])
+            else:
+                logger.info("ingest_from_upload success — filename=%s type=archive", uploaded_filename)
             return tree, meta
 
         # 用文件名（保留扩展名）作为根目录名，例：main.py → main.py
+        logger.info("ingest_from_upload — detected single file — filename=%s", uploaded_filename)
         file_stem = uploaded_filename if uploaded_filename else "upload"
         single_root = td_path / (file_stem or "upload")
         single_root.mkdir(parents=True, exist_ok=True)
@@ -281,5 +349,9 @@ async def ingest_from_upload(
         s3_err = await _upload_extracted_folder_to_s3(single_root)
         tree = build_dir_tree(single_root, display_root=single_root.name)
         meta = {"source": "upload", "type": "file", "filename": uploaded_filename, "s3_upload": "Success" if s3_err is None else s3_err}
+        if s3_err:
+            logger.warning("ingest_from_upload complete (S3 failed) — filename=%s type=file s3_error=%s", uploaded_filename, s3_err[:200])
+        else:
+            logger.info("ingest_from_upload success — filename=%s type=file", uploaded_filename)
         return tree, meta
 
