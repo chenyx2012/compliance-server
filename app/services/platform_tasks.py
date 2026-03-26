@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import ExitStack
 from typing import Any, Dict, Optional
 
 import httpx
@@ -55,6 +56,8 @@ def sentry_mission_task(
     third_party: bool = False,
     fallback_tree: bool = False,
     branch_tag: Optional[str] = None,
+    temp_shadow_path: Optional[str] = None,
+    temp_license_shadow_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     mode: upload | git
@@ -63,8 +66,14 @@ def sentry_mission_task(
     """
     task_id = self.request.id
     logger.info(
-        "sentry_mission_task start — task_id=%s mode=%s project_name=%s git_url=%s temp_path=%s",
-        task_id, mode, project_name, git_url, temp_path
+        "sentry_mission_task start — task_id=%s mode=%s project_name=%s git_url=%s temp_path=%s shadow=%s license_shadow=%s",
+        task_id,
+        mode,
+        project_name,
+        git_url,
+        bool(temp_path),
+        bool(temp_shadow_path),
+        bool(temp_license_shadow_path),
     )
     
     base = settings.compliance_sentry_base_url.rstrip("/") + "/api/v1"
@@ -81,19 +90,46 @@ def sentry_mission_task(
     try:
         if mode == "upload":
             if not temp_path or not os.path.isfile(temp_path):
-                logger.error("sentry_mission_task — missing temp file — task_id=%s temp_path=%s", task_id, temp_path)
+                logger.error(
+                    "sentry_mission_task — missing temp file — task_id=%s temp_path=%s",
+                    task_id,
+                    temp_path,
+                )
                 return {"ok": False, "error": "missing temp file for upload"}
-            
-            logger.info("sentry_mission_task — uploading file — task_id=%s file=%s size=%d bytes", 
-                       task_id, os.path.basename(temp_path), os.path.getsize(temp_path))
-            
-            with open(temp_path, "rb") as f:
-                files = {"file": (os.path.basename(temp_path), f, "application/zip")}
-                data = {
-                    "project_name": project_name,
-                    "third_party": str(third_party).lower(),
-                    "fallback_tree": str(fallback_tree).lower(),
+
+            data: Dict[str, Any] = {
+                "project_name": project_name,
+                "third_party": str(third_party).lower(),
+                "fallback_tree": str(fallback_tree).lower(),
+            }
+
+            logger.info(
+                "sentry_mission_task — uploading zip — task_id=%s file=%s size=%d bytes",
+                task_id,
+                os.path.basename(temp_path),
+                os.path.getsize(temp_path),
+            )
+
+            with ExitStack() as stack:
+                f_main = stack.enter_context(open(temp_path, "rb"))
+                files: Dict[str, Any] = {
+                    "file": (os.path.basename(temp_path), f_main, "application/zip"),
                 }
+                if temp_shadow_path and os.path.isfile(temp_shadow_path):
+                    f_shadow = stack.enter_context(open(temp_shadow_path, "rb"))
+                    files["shadow_file"] = (
+                        os.path.basename(temp_shadow_path),
+                        f_shadow,
+                        "application/octet-stream",
+                    )
+                if temp_license_shadow_path and os.path.isfile(temp_license_shadow_path):
+                    f_license = stack.enter_context(open(temp_license_shadow_path, "rb"))
+                    files["license_shadow"] = (
+                        os.path.basename(temp_license_shadow_path),
+                        f_license,
+                        "application/octet-stream",
+                    )
+
                 r = httpx.post(
                     f"{base}/mission/upload",
                     files=files,
@@ -109,7 +145,7 @@ def sentry_mission_task(
             
             logger.info("sentry_mission_task — submitting git — task_id=%s git_url=%s", task_id, git_url)
             
-            data: Dict[str, Any] = {
+            data = {
                 "project_name": project_name,
                 "git_url": git_url,
                 "third_party": str(third_party).lower(),
@@ -117,13 +153,44 @@ def sentry_mission_task(
             }
             if branch_tag:
                 data["branch_tag"] = branch_tag
-            r = httpx.post(
-                f"{base}/mission/git",
-                data=data,
-                headers=headers,
-                timeout=600.0,
-                proxy=_proxy,
-            )
+
+            files: Optional[Dict[str, Any]] = None
+            if (temp_shadow_path and os.path.isfile(temp_shadow_path)) or (
+                temp_license_shadow_path and os.path.isfile(temp_license_shadow_path)
+            ):
+                with ExitStack() as stack:
+                    files = {}
+                    if temp_shadow_path and os.path.isfile(temp_shadow_path):
+                        f_shadow = stack.enter_context(open(temp_shadow_path, "rb"))
+                        files["shadow_file"] = (
+                            os.path.basename(temp_shadow_path),
+                            f_shadow,
+                            "application/octet-stream",
+                        )
+                    if temp_license_shadow_path and os.path.isfile(temp_license_shadow_path):
+                        f_license = stack.enter_context(open(temp_license_shadow_path, "rb"))
+                        files["license_shadow"] = (
+                            os.path.basename(temp_license_shadow_path),
+                            f_license,
+                            "application/octet-stream",
+                        )
+
+                    r = httpx.post(
+                        f"{base}/mission/git",
+                        data=data,
+                        files=files,
+                        headers=headers,
+                        timeout=600.0,
+                        proxy=_proxy,
+                    )
+            else:
+                r = httpx.post(
+                    f"{base}/mission/git",
+                    data=data,
+                    headers=headers,
+                    timeout=600.0,
+                    proxy=_proxy,
+                )
         else:
             logger.error("sentry_mission_task — unknown mode — task_id=%s mode=%s", task_id, mode)
             return {"ok": False, "error": f"unknown mode: {mode}"}
@@ -157,3 +224,33 @@ def sentry_mission_task(
             except OSError as e:
                 logger.warning("sentry_mission_task — failed to delete temp file — task_id=%s path=%s error=%s", 
                               task_id, temp_path, e)
+        if temp_shadow_path and os.path.isfile(temp_shadow_path):
+            try:
+                os.unlink(temp_shadow_path)
+                logger.info(
+                    "sentry_mission_task — temp shadow deleted — task_id=%s path=%s",
+                    task_id,
+                    temp_shadow_path,
+                )
+            except OSError as e:
+                logger.warning(
+                    "sentry_mission_task — failed to delete temp shadow — task_id=%s path=%s error=%s",
+                    task_id,
+                    temp_shadow_path,
+                    e,
+                )
+        if temp_license_shadow_path and os.path.isfile(temp_license_shadow_path):
+            try:
+                os.unlink(temp_license_shadow_path)
+                logger.info(
+                    "sentry_mission_task — temp license_shadow deleted — task_id=%s path=%s",
+                    task_id,
+                    temp_license_shadow_path,
+                )
+            except OSError as e:
+                logger.warning(
+                    "sentry_mission_task — failed to delete temp license_shadow — task_id=%s path=%s error=%s",
+                    task_id,
+                    temp_license_shadow_path,
+                    e,
+                )

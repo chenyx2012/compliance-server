@@ -159,32 +159,12 @@ async def _upload_extracted_folder_to_s3(local_folder_absolute_path: Path) -> Op
             stderr=asyncio.subprocess.STDOUT,  # 合并 stderr 到 stdout
             cwd=str(script_path.parent),
         )
-        
-        # 实时读取并记录 S3 上传脚本的输出
-        assert proc.stdout is not None
-        line_count = 0
-        while True:
-            line_bytes = await proc.stdout.readline()
-            if not line_bytes:
-                break
-            line = line_bytes.decode("utf-8", errors="replace").rstrip()
-            if line:
-                line_count += 1
-                # 输出格式：[s3_uploader] <原始输出>
-                logger.info("[s3_uploader] %s", line)
-        
-        await asyncio.wait_for(proc.wait(), timeout=600)
-        
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
         if proc.returncode != 0:
-            logger.error(
-                "s3 upload failed — folder=%s returncode=%d total_output_lines=%d",
-                local_folder_absolute_path.name,
-                proc.returncode,
-                line_count,
-            )
-            return f"S3 upload failed with exit code {proc.returncode}"
+            err = (stderr or stdout or b"").decode("utf-8", errors="replace").strip()
+            return err or f"exit code {proc.returncode}"
         
-        logger.info("s3 upload success — folder=%s total_output_lines=%d", local_folder_absolute_path.name, line_count)
+        logger.info("s3 upload success — folder=%s total_output_lines=%d", local_folder_absolute_path.name)
         return None
         
     except asyncio.TimeoutError:

@@ -27,7 +27,7 @@ import logging
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 from celery.result import AsyncResult
@@ -617,9 +617,9 @@ async def compliance_sentry_proxy_fallback(path: str, request: Request):
 )
 async def platform_tasks(
     project_name: str = Form(..., description="任务/项目名称（提交 sentry 必填）"),
-    service: str = Form(
-        "none",
-        description="扫描服务：none 仅入库目录树；compliance-sentry 额外提交 sentry 分析任务",
+    services: List[str] = Form(
+        ...,
+        description="扫描服务多选：S1/S2/S3/S4；其中 S3=compliance-sentry",
     ),
     async_scan: bool = Form(False, description="为 true 时 sentry 提交走 Celery，立即返回 task_id"),
     source_url: Optional[str] = Form(None, description="Git 仓库地址（与 file 二选一）"),
@@ -627,16 +627,42 @@ async def platform_tasks(
     third_party: bool = Form(False),
     fallback_tree: bool = Form(False),
     branch_tag: Optional[str] = Form(None, description="git 任务可选分支"),
+    shadow_file: Optional[UploadFile] = File(None, description="compliance-sentry mission 的 shadow_file"),
+    license_shadow: Optional[UploadFile] = File(None, description="compliance-sentry mission 的 license_shadow"),
     db: AsyncSession = Depends(get_db),
 ) -> Dict[str, Any]:
     """
     平台任务总入口（支持异步）：
     1. 根据 file 或 source_url 拉取代码并解析目录树，写入 MySQL（ingest_id）；
-    2. 若 service=compliance-sentry：再向 sentry 提交 mission/upload（zip）或 mission/git（仓库地址）。
+    2. 若 services 包含 `S3`（compliance-sentry）：再向 sentry 提交 mission/upload（zip）或 mission/git（仓库地址）。
     """
+    services_norm = []
+    for s in services:
+        if s is None:
+            continue
+        sn = s.strip().upper()
+        # 兼容前端可能一次提交逗号分隔字符串的情况
+        if "," in sn:
+            services_norm.extend([x.strip() for x in sn.split(",") if x.strip()])
+        else:
+            services_norm.append(sn)
+    allowed = {"S1", "S2", "S3", "S4"}
+    invalid = [s for s in services_norm if s not in allowed]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"invalid services: {invalid}, allowed: {sorted(allowed)}")
+    if not services_norm:
+        raise HTTPException(status_code=400, detail="services must not be empty")
+
+    want_s3 = "S3" in set(services_norm)
+
     logger.info(
-        "platform_tasks start — project_name=%s service=%s async_scan=%s source_url=%s file=%s",
-        project_name, service, async_scan, source_url, file.filename if file else None
+        "platform_tasks start — project_name=%s services=%s want_s3=%s async_scan=%s source_url=%s file=%s",
+        project_name,
+        services_norm,
+        want_s3,
+        async_scan,
+        source_url,
+        file.filename if file else None,
     )
     
     if (not source_url or not source_url.strip()) and file is None:
@@ -684,12 +710,13 @@ async def platform_tasks(
         "ingest_id": ingest_id,
         "meta": meta,
         "tree": tree,
-        "service": service,
+        "services": services_norm,
+        # 兼容旧字段：单服务情况下仍可用于前端展示
+        "service": "compliance-sentry" if want_s3 else "none",
     }
 
-    svc = (service or "none").strip().lower()
-    if svc != "compliance-sentry":
-        logger.info("platform_tasks complete (no sentry) — ingest_id=%d service=%s", ingest_id, svc)
+    if not want_s3:
+        logger.info("platform_tasks complete (no compliance-sentry) — ingest_id=%d services=%s", ingest_id, services_norm)
         return out
 
     if not settings.compliance_sentry_base_url:
@@ -707,6 +734,22 @@ async def platform_tasks(
 
     if source_url and source_url.strip():
         if async_scan:
+            temp_shadow_path = None
+            temp_license_shadow_path = None
+            if shadow_file is not None:
+                shadow_bytes = await shadow_file.read()
+                shadow_suffix = Path(shadow_file.filename or "").suffix or ".shadow"
+                fd, tmp = tempfile.mkstemp(suffix=shadow_suffix)
+                os.close(fd)
+                Path(tmp).write_bytes(shadow_bytes)
+                temp_shadow_path = tmp
+            if license_shadow is not None:
+                license_bytes = await license_shadow.read()
+                license_suffix = Path(license_shadow.filename or "").suffix or ".license"
+                fd, tmp = tempfile.mkstemp(suffix=license_suffix)
+                os.close(fd)
+                Path(tmp).write_bytes(license_bytes)
+                temp_license_shadow_path = tmp
             ar = sentry_mission_task.apply_async(
                 kwargs={
                     "mode": "git",
@@ -716,6 +759,8 @@ async def platform_tasks(
                     "third_party": third_party,
                     "fallback_tree": fallback_tree,
                     "branch_tag": branch_tag,
+                    "temp_shadow_path": temp_shadow_path,
+                    "temp_license_shadow_path": temp_license_shadow_path,
                 },
             )
             out["sentry_async"] = True
@@ -735,8 +780,20 @@ async def platform_tasks(
         if branch_tag:
             form_git["branch_tag"] = branch_tag
         _proxy = settings.compliance_sentry_proxy or None
+        files: Dict[str, Any] = {}
+        if shadow_file is not None:
+            shadow_bytes = await shadow_file.read()
+            files["shadow_file"] = (shadow_file.filename or "shadow_file", shadow_bytes, "application/octet-stream")
+        if license_shadow is not None:
+            license_bytes = await license_shadow.read()
+            files["license_shadow"] = (license_shadow.filename or "license_shadow", license_bytes, "application/octet-stream")
         async with httpx.AsyncClient(timeout=httpx.Timeout(600.0), proxy=_proxy) as client:
-            r = await client.post(f"{base}/mission/git", data=form_git, headers=sentry_headers)
+            r = await client.post(
+                f"{base}/mission/git",
+                data=form_git,
+                files=files or None,
+                headers=sentry_headers,
+            )
         try:
             sentry_body = r.json()
         except Exception:
@@ -767,6 +824,22 @@ async def platform_tasks(
         fd, tmp = tempfile.mkstemp(suffix=os.path.splitext(fname)[1] or ".zip")
         os.close(fd)
         Path(tmp).write_bytes(file_bytes)
+        temp_shadow_path = None
+        temp_license_shadow_path = None
+        if shadow_file is not None:
+            shadow_bytes = await shadow_file.read()
+            shadow_suffix = Path(shadow_file.filename or "").suffix or ".shadow"
+            fd, tmp_shadow = tempfile.mkstemp(suffix=shadow_suffix)
+            os.close(fd)
+            Path(tmp_shadow).write_bytes(shadow_bytes)
+            temp_shadow_path = tmp_shadow
+        if license_shadow is not None:
+            license_bytes = await license_shadow.read()
+            license_suffix = Path(license_shadow.filename or "").suffix or ".license"
+            fd, tmp_license = tempfile.mkstemp(suffix=license_suffix)
+            os.close(fd)
+            Path(tmp_license).write_bytes(license_bytes)
+            temp_license_shadow_path = tmp_license
         ar = sentry_mission_task.apply_async(
             kwargs={
                 "mode": "upload",
@@ -776,6 +849,8 @@ async def platform_tasks(
                 "third_party": third_party,
                 "fallback_tree": fallback_tree,
                 "branch_tag": None,
+                "temp_shadow_path": temp_shadow_path,
+                "temp_license_shadow_path": temp_license_shadow_path,
             },
         )
         out["sentry_async"] = True
@@ -789,7 +864,13 @@ async def platform_tasks(
     base = settings.compliance_sentry_base_url.rstrip("/") + "/api/v1"
     _proxy = settings.compliance_sentry_proxy or None
     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0), proxy=_proxy) as client:
-        files = {"file": (upload_filename or "upload.zip", file_bytes, "application/zip")}
+        files: Dict[str, Any] = {"file": (upload_filename or "upload.zip", file_bytes, "application/zip")}
+        if shadow_file is not None:
+            shadow_bytes = await shadow_file.read()
+            files["shadow_file"] = (shadow_file.filename or "shadow_file", shadow_bytes, "application/octet-stream")
+        if license_shadow is not None:
+            license_bytes = await license_shadow.read()
+            files["license_shadow"] = (license_shadow.filename or "license_shadow", license_bytes, "application/octet-stream")
         form = {
             "project_name": project_name,
             "third_party": str(third_party).lower(),
@@ -812,7 +893,7 @@ async def platform_tasks(
             "platform_tasks — sentry sync success (upload) — ingest_id=%d analysis_id=%s",
             ingest_id, sentry_body.get("analysis_id", "N/A")
         )
-    return out
+    return out 
 
 
 @router.get(

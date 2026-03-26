@@ -67,7 +67,7 @@ const data = await res.json()
 // 提交平台任务，同样无需 Authorization
 const form = new FormData()
 form.append('project_name', 'my-project')
-form.append('service', 'compliance-sentry')
+form.append('services', 'S3')
 form.append('file', zipFile)
 const taskRes = await fetch('/platform/tasks', {
   method: 'POST',
@@ -90,20 +90,22 @@ const taskRes = await fetch('/platform/tasks', {
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `project_name` | string | 是 | 任务/项目名称（提交 sentry 时作为 mission 名称） |
-| `service` | string | 否 | `none`（默认，仅入库目录树）或 `compliance-sentry`（额外提交扫描） |
+| `services` | string[] | 是 | `S1`/`S2`/`S3`/`S4` 多选；其中 `S3`=compliance-sentry |
 | `async_scan` | boolean | 否 | `false`（默认，同步等待 sentry 返回）或 `true`（Celery 异步，立即返回 `platform_task_id`） |
 | `source_url` | string | 二选一 | Git 仓库地址（与 `file` 二选一） |
 | `file` | file | 二选一 | 上传文件（zip/tar.gz/tgz；提交 sentry 时必须为 zip/tar.gz） |
 | `third_party` | boolean | 否 | 是否启用第三方依赖扫描，透传给 sentry，默认 `false` |
 | `fallback_tree` | boolean | 否 | 是否启用 fallback-tree 解析，透传给 sentry，默认 `false` |
 | `branch_tag` | string | 否 | Git 分支或 tag 名（仅 git 任务有效） |
+| `shadow_file` | file | 否 | compliance-sentry mission 的 shadow 文件 |
+| `license_shadow` | file | 否 | compliance-sentry mission 的 license shadow 文件 |
 
 ### 示例：上传 zip 文件并同步扫描
 
 ```javascript
 const form = new FormData()
 form.append('project_name', 'my-project')
-form.append('service', 'compliance-sentry')
+form.append('services', 'S3')
 form.append('async_scan', 'false')
 form.append('file', zipFile)  // File 对象
 
@@ -121,7 +123,7 @@ const data = await res.json()
 ```javascript
 const form = new FormData()
 form.append('project_name', 'my-project')
-form.append('service', 'compliance-sentry')
+form.append('services', 'S3')
 form.append('async_scan', 'true')
 form.append('source_url', 'https://github.com/owner/repo.git')
 
@@ -148,6 +150,7 @@ const data = await res.json()
     "s3_upload": "Success"
   },
   "tree": { "path": "project", "next": {}, "content": null },
+  "services": ["S3"],
   "service": "compliance-sentry",
   "sentry": {
     "status_code": 202,
@@ -167,6 +170,7 @@ const data = await res.json()
   "ingest_id": 42,
   "meta": { "..." : "..." },
   "tree": { "..." : "..." },
+  "services": ["S3"],
   "service": "compliance-sentry",
   "sentry_async": true,
   "platform_task_id": "celery-task-uuid"
