@@ -616,7 +616,7 @@ async def compliance_sentry_proxy_fallback(path: str, request: Request):
     tags=["platform"],
 )
 async def platform_tasks(
-    project_name: str = Form(..., description="任务/项目名称（提交 sentry 必填）"),
+    task_name: str = Form(..., description="任务名称（提交 sentry 必填）"),
     services: List[str] = Form(
         ...,
         description="扫描服务多选：S1/S2/S3/S4；其中 S3=compliance-sentry",
@@ -656,8 +656,8 @@ async def platform_tasks(
     want_s3 = "S3" in set(services_norm)
 
     logger.info(
-        "platform_tasks start — project_name=%s services=%s want_s3=%s async_scan=%s source_url=%s file=%s",
-        project_name,
+        "platform_tasks start — task_name=%s services=%s want_s3=%s async_scan=%s source_url=%s file=%s",
+        task_name,
         services_norm,
         want_s3,
         async_scan,
@@ -701,12 +701,12 @@ async def platform_tasks(
     ingest_id = row.id
     
     logger.info(
-        "platform_tasks — ingest complete — ingest_id=%d source_type=%s source_label=%s s3_status=%s",
-        ingest_id, source_type, source_label[:50] if source_label else "N/A", s3_status
+        "platform_tasks — ingest complete — ingest_id=%d task_name=%s source_type=%s source_label=%s s3_status=%s",
+        ingest_id, task_name, source_type, source_label[:50] if source_label else "N/A", s3_status
     )
 
     out: Dict[str, Any] = {
-        "ok": True,
+        "status": "success",
         "ingest_id": ingest_id,
         "meta": meta,
         "tree": tree,
@@ -716,13 +716,13 @@ async def platform_tasks(
     }
 
     if not want_s3:
-        logger.info("platform_tasks complete (no compliance-sentry) — ingest_id=%d services=%s", ingest_id, services_norm)
+        logger.info("platform_tasks complete (no compliance-sentry) — ingest_id=%d task_name=%s services=%s", ingest_id, task_name, services_norm)
         return out
 
     if not settings.compliance_sentry_base_url:
         raise HTTPException(status_code=503, detail="COMPLIANCE_SENTRY_BASE_URL not configured")
     
-    logger.info("platform_tasks — submitting to sentry — ingest_id=%d async=%s", ingest_id, async_scan)
+    logger.info("platform_tasks — submitting to sentry — ingest_id=%d task_name=%s async=%s", ingest_id, task_name, async_scan)
 
     # 自动获取 sentry token，前端无需传 Authorization
     try:
@@ -753,7 +753,7 @@ async def platform_tasks(
             ar = sentry_mission_task.apply_async(
                 kwargs={
                     "mode": "git",
-                    "project_name": project_name,
+                    "task_name": task_name,
                     "temp_path": None,
                     "git_url": source_url.strip(),
                     "third_party": third_party,
@@ -766,13 +766,13 @@ async def platform_tasks(
             out["sentry_async"] = True
             out["platform_task_id"] = ar.id
             logger.info(
-                "platform_tasks — submitted to sentry async (git) — ingest_id=%d celery_task_id=%s git_url=%s",
-                ingest_id, ar.id, source_url.strip()
+                "platform_tasks — submitted to sentry async (git) — ingest_id=%d task_name=%s celery_task_id=%s git_url=%s",
+                ingest_id, task_name, ar.id, source_url.strip()
             )
             return out
         base = settings.compliance_sentry_base_url.rstrip("/") + "/api/v1"
         form_git = {
-            "project_name": project_name,
+            "project_name": task_name,
             "git_url": source_url.strip(),
             "third_party": str(third_party).lower(),
             "fallback_tree": str(fallback_tree).lower(),
@@ -800,15 +800,16 @@ async def platform_tasks(
             sentry_body = {"raw": r.text[:2000]}
         out["sentry"] = {"status_code": r.status_code, "body": sentry_body}
         if not r.is_success:
-            out["ok"] = False
+            out["status"] = "error"
+            out["error"] = sentry_body
             logger.error(
-                "platform_tasks — sentry sync failed (git) — ingest_id=%d status=%d body=%s",
-                ingest_id, r.status_code, str(sentry_body)[:300]
+                "platform_tasks — sentry sync failed (git) — ingest_id=%d task_name=%s status=%d body=%s",
+                ingest_id, task_name, r.status_code, str(sentry_body)[:300]
             )
         else:
             logger.info(
-                "platform_tasks — sentry sync success (git) — ingest_id=%d analysis_id=%s",
-                ingest_id, sentry_body.get("analysis_id", "N/A")
+                "platform_tasks — sentry sync success (git) — ingest_id=%d task_name=%s analysis_id=%s",
+                ingest_id, task_name, sentry_body.get("analysis_id", "N/A")
             )
         return out
 
@@ -843,7 +844,7 @@ async def platform_tasks(
         ar = sentry_mission_task.apply_async(
             kwargs={
                 "mode": "upload",
-                "project_name": project_name,
+                "task_name": task_name,
                 "temp_path": tmp,
                 "git_url": None,
                 "third_party": third_party,
@@ -856,8 +857,8 @@ async def platform_tasks(
         out["sentry_async"] = True
         out["platform_task_id"] = ar.id
         logger.info(
-            "platform_tasks — submitted to sentry async (upload) — ingest_id=%d celery_task_id=%s file=%s",
-            ingest_id, ar.id, upload_filename
+            "platform_tasks — submitted to sentry async (upload) — ingest_id=%d task_name=%s celery_task_id=%s file=%s",
+            ingest_id, task_name, ar.id, upload_filename
         )
         return out
 
@@ -872,7 +873,7 @@ async def platform_tasks(
             license_bytes = await license_shadow.read()
             files["license_shadow"] = (license_shadow.filename or "license_shadow", license_bytes, "application/octet-stream")
         form = {
-            "project_name": project_name,
+            "project_name": task_name,
             "third_party": str(third_party).lower(),
             "fallback_tree": str(fallback_tree).lower(),
         }
@@ -883,15 +884,16 @@ async def platform_tasks(
         sentry_body = {"raw": r.text[:2000]}
     out["sentry"] = {"status_code": r.status_code, "body": sentry_body}
     if not r.is_success:
-        out["ok"] = False
+        out["status"] = "error"
+        out["error"] = sentry_body
         logger.error(
-            "platform_tasks — sentry sync failed (upload) — ingest_id=%d status=%d body=%s",
-            ingest_id, r.status_code, str(sentry_body)[:300]
+            "platform_tasks — sentry sync failed (upload) — ingest_id=%d task_name=%s status=%d body=%s",
+            ingest_id, task_name, r.status_code, str(sentry_body)[:300]
         )
     else:
         logger.info(
-            "platform_tasks — sentry sync success (upload) — ingest_id=%d analysis_id=%s",
-            ingest_id, sentry_body.get("analysis_id", "N/A")
+            "platform_tasks — sentry sync success (upload) — ingest_id=%d task_name=%s analysis_id=%s",
+            ingest_id, task_name, sentry_body.get("analysis_id", "N/A")
         )
     return out 
 

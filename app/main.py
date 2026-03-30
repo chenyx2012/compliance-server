@@ -89,7 +89,7 @@ def _normalize_modules(modules: Optional[List[str]]) -> Optional[List[str]]:
 @app.get("/healthz")
 def healthz() -> Dict[str, Any]:
     """K8s/负载均衡健康检查探针。"""
-    return {"ok": True, "service": settings.app_name, "env": settings.env}
+    return {"status": "success", "service": settings.app_name, "env": settings.env}
 
 
 @app.post("/scan/sync")
@@ -175,5 +175,6 @@ async def files_ingest(
     db.add(row)
     await db.flush()
     ingest_id = row.id
-    return {"ok": True, "ingest_id": ingest_id, "meta": meta, "tree": tree}
+    logger.info("files_ingest done: ingest_id=%s source_type=%s s3_status=%s", ingest_id, source_type, s3_status)
+    return {"status": "success", "ingest_id": ingest_id, "meta": meta, "tree": tree}
 

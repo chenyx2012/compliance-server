@@ -50,7 +50,7 @@ def _get_token_sync() -> str:
 def sentry_mission_task(
     self,
     mode: str,
-    project_name: str,
+    task_name: str,
     temp_path: Optional[str] = None,
     git_url: Optional[str] = None,
     third_party: bool = False,
@@ -66,10 +66,10 @@ def sentry_mission_task(
     """
     task_id = self.request.id
     logger.info(
-        "sentry_mission_task start — task_id=%s mode=%s project_name=%s git_url=%s temp_path=%s shadow=%s license_shadow=%s",
+        "sentry_mission_task start — task_id=%s mode=%s task_name=%s git_url=%s temp_path=%s shadow=%s license_shadow=%s",
         task_id,
         mode,
-        project_name,
+        task_name,
         git_url,
         bool(temp_path),
         bool(temp_shadow_path),
@@ -82,7 +82,7 @@ def sentry_mission_task(
         token = _get_token_sync()
     except RuntimeError as e:
         logger.error("sentry_mission_task auth failed — task_id=%s error=%s", task_id, e)
-        return {"ok": False, "error": f"sentry auth failed: {e}"}
+        return {"status": "error", "error": f"sentry auth failed: {e}"}
 
     headers: Dict[str, str] = {"Authorization": f"Bearer {token}"}
 
@@ -95,10 +95,10 @@ def sentry_mission_task(
                     task_id,
                     temp_path,
                 )
-                return {"ok": False, "error": "missing temp file for upload"}
+                return {"status": "error", "error": "missing temp file for upload"}
 
             data: Dict[str, Any] = {
-                "project_name": project_name,
+                "project_name": task_name,
                 "third_party": str(third_party).lower(),
                 "fallback_tree": str(fallback_tree).lower(),
             }
@@ -141,12 +141,12 @@ def sentry_mission_task(
         elif mode == "git":
             if not git_url:
                 logger.error("sentry_mission_task — missing git_url — task_id=%s", task_id)
-                return {"ok": False, "error": "missing git_url"}
+                return {"status": "error", "error": "missing git_url"}
             
             logger.info("sentry_mission_task — submitting git — task_id=%s git_url=%s", task_id, git_url)
             
             data = {
-                "project_name": project_name,
+                "project_name": task_name,
                 "git_url": git_url,
                 "third_party": str(third_party).lower(),
                 "fallback_tree": str(fallback_tree).lower(),
@@ -193,7 +193,7 @@ def sentry_mission_task(
                 )
         else:
             logger.error("sentry_mission_task — unknown mode — task_id=%s mode=%s", task_id, mode)
-            return {"ok": False, "error": f"unknown mode: {mode}"}
+            return {"status": "error", "error": f"unknown mode: {mode}"}
 
         try:
             body = r.json()
@@ -205,17 +205,17 @@ def sentry_mission_task(
                 "sentry_mission_task success — task_id=%s mode=%s status=%d analysis_id=%s",
                 task_id, mode, r.status_code, body.get("analysis_id", "N/A")
             )
-            return {"ok": True, "status_code": r.status_code, "sentry": body}
+            return {"status": "success", "status_code": r.status_code, "sentry": body}
         
         logger.error(
             "sentry_mission_task failed — task_id=%s mode=%s status=%d body=%s",
             task_id, mode, r.status_code, str(body)[:500]
         )
-        return {"ok": False, "status_code": r.status_code, "error": body}
+        return {"status": "error", "status_code": r.status_code, "error": body}
 
     except Exception as e:
         logger.error("sentry_mission_task exception — task_id=%s mode=%s error=%s", task_id, mode, str(e))
-        return {"ok": False, "error": str(e)}
+        return {"status": "error", "error": str(e)}
     finally:
         if temp_path and os.path.isfile(temp_path):
             try:

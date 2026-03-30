@@ -66,7 +66,7 @@ const data = await res.json()
 
 // 提交平台任务，同样无需 Authorization
 const form = new FormData()
-form.append('project_name', 'my-project')
+form.append('task_name', 'my-project')
 form.append('services', 'S3')
 form.append('file', zipFile)
 const taskRes = await fetch('/platform/tasks', {
@@ -89,7 +89,7 @@ const taskRes = await fetch('/platform/tasks', {
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `project_name` | string | 是 | 任务/项目名称（提交 sentry 时作为 mission 名称） |
+| `task_name` | string | 是 | 任务/项目名称（提交 sentry 时作为 mission 名称） |
 | `services` | string[] | 是 | `S1`/`S2`/`S3`/`S4` 多选；其中 `S3`=compliance-sentry |
 | `async_scan` | boolean | 否 | `false`（默认，同步等待 sentry 返回）或 `true`（Celery 异步，立即返回 `platform_task_id`） |
 | `source_url` | string | 二选一 | Git 仓库地址（与 `file` 二选一） |
@@ -104,7 +104,7 @@ const taskRes = await fetch('/platform/tasks', {
 
 ```javascript
 const form = new FormData()
-form.append('project_name', 'my-project')
+form.append('task_name', 'my-project')
 form.append('services', 'S3')
 form.append('async_scan', 'false')
 form.append('file', zipFile)  // File 对象
@@ -122,7 +122,7 @@ const data = await res.json()
 
 ```javascript
 const form = new FormData()
-form.append('project_name', 'my-project')
+form.append('task_name', 'my-project')
 form.append('services', 'S3')
 form.append('async_scan', 'true')
 form.append('source_url', 'https://github.com/owner/repo.git')
@@ -141,7 +141,7 @@ const data = await res.json()
 
 ```json
 {
-  "ok": true,
+  "status": "success",
   "ingest_id": 42,
   "meta": {
     "source": "upload",
@@ -162,11 +162,26 @@ const data = await res.json()
 }
 ```
 
+**同步模式（sentry 失败）：**
+
+```json
+{
+  "status": "error",
+  "ingest_id": 42,
+  "meta": { "..." : "..." },
+  "tree": { "..." : "..." },
+  "services": ["S3"],
+  "service": "compliance-sentry",
+  "sentry": { "status_code": 500, "body": { "error": "..." } },
+  "error": { "error": "..." }
+}
+```
+
 **异步模式（`async_scan=true`）：**
 
 ```json
 {
-  "ok": true,
+  "status": "success",
   "ingest_id": 42,
   "meta": { "..." : "..." },
   "tree": { "..." : "..." },
@@ -197,14 +212,15 @@ GET /platform/tasks/result/{platform_task_id}
 
 ```json
 // 进行中
-{ "task_id": "xxx", "state": "PENDING" }
+{ "status": "pending", "task_id": "xxx", "state": "PENDING" }
 
 // 成功
 {
+  "status": "success",
   "task_id": "xxx",
   "state": "SUCCESS",
   "result": {
-    "ok": true,
+    "status": "success",
     "status_code": 202,
     "sentry": {
       "analysis_id": "uuid-xxxx",
@@ -214,7 +230,7 @@ GET /platform/tasks/result/{platform_task_id}
 }
 
 // 失败
-{ "task_id": "xxx", "state": "FAILURE", "error": "错误信息" }
+{ "status": "error", "task_id": "xxx", "state": "FAILURE", "error": "错误信息" }
 ```
 
 ---
@@ -308,8 +324,8 @@ curl -X POST /platform/compliance-sentry/v1/auth/login \
     "email": "admin@example.com",
     "role": "admin",
     "user_id": "uuid-xxxx",
-    "created_at": "2025-11-15T10:14:38Z",
-    "last_login": "2026-03-19T01:16:59Z",
+    "created_at": "2025-11-15 10:14:38",
+    "last_login": "2026-03-19 01:16:59",
     "api_quota": null
   }
 }
@@ -397,8 +413,8 @@ curl -X POST /platform/compliance-sentry/v1/auth/login \
   "email": "admin@example.com",
   "role": "admin",
   "user_id": "uuid-xxxx",
-  "created_at": "2025-11-15T10:14:38Z",
-  "last_login": "2026-03-19T01:16:59Z",
+  "created_at": "2025-11-15 10:14:38",
+  "last_login": "2026-03-19 01:16:59",
   "api_quota": null
 }
 ```
@@ -426,8 +442,8 @@ curl -X POST /platform/compliance-sentry/v1/auth/login \
       "email": "admin@example.com",
       "role": "admin",
       "user_id": "uuid-xxxx",
-      "created_at": "2025-11-15T10:14:38Z",
-      "last_login": "2026-03-19T01:16:59Z"
+      "created_at": "2025-11-15 10:14:38",
+      "last_login": "2026-03-19 01:16:59"
     }
   ],
   "total": 1,
@@ -514,8 +530,8 @@ curl -X POST /platform/compliance-sentry/v1/auth/login \
       "analysis_id": "uuid-xxxx",
       "project_name": "my-project",
       "status": "completed",
-      "created_at": "2026-03-01T10:00:00Z",
-      "updated_at": "2026-03-01T10:30:00Z",
+      "created_at": "2026-03-01 10:00:00",
+      "updated_at": "2026-03-01 10:30:00",
       "progress": 100
     }
   ],
@@ -759,8 +775,8 @@ const timer = setInterval(async () => {
     "project_name": "my-app",
     "current_status": "running",
     "progress": 45,
-    "created_at": "2026-03-01T10:00:00Z",
-    "updated_at": "2026-03-01T10:15:00Z",
+    "created_at": "2026-03-01 10:00:00",
+    "updated_at": "2026-03-01 10:15:00",
     "error_message": null
   }
 }
@@ -1094,7 +1110,7 @@ const timer = setInterval(async () => {
 
 ```json
 {
-  "timestamp": "2026-03-01T10:15:00Z",
+  "timestamp": "2026-03-01 10:15:00",
   "cpu_percent": 42.5,
   "memory_mb": 1024.0
 }
@@ -1398,7 +1414,7 @@ const timer = setInterval(async () => {
 
 ```json
 {
-  "timestamp": "2026-03-19T10:00:00Z",
+  "timestamp": "2026-03-19 10:00:00",
   "cpu_percent": 35.2,
   "memory_total_mb": 16384,
   "memory_used_mb": 8192,

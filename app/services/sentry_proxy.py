@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Dict
+import re
+from datetime import datetime
+from typing import Any, Dict, List, Union
 
 import httpx
 from fastapi import Request, Response
@@ -21,6 +23,64 @@ from app.core.config import settings
 from app.services.sentry_auth import get_auth_header, get_token
 
 logger = logging.getLogger(__name__)
+
+# 需要格式化的时间字段名（以这些结尾的字段会被检测）
+TIME_FIELD_SUFFIXES = ("_at", "_time", "timestamp", "created_by", "updated_by")
+
+
+def _format_datetime(iso_str: str) -> str:
+    """
+    将 ISO 8601 时间字符串转换为 yyyy-MM-dd HH:mm:ss 格式。
+    支持格式：2026-03-01T10:00:00Z、2026-03-01T10:00:00.123456Z、2026-03-01T10:00:00+08:00 等。
+    """
+    if not isinstance(iso_str, str):
+        return iso_str
+    
+    # 匹配 ISO 8601 格式（宽松匹配）
+    iso_pattern = r"^\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}"
+    if not re.match(iso_pattern, iso_str):
+        return iso_str
+    
+    try:
+        # 尝试解析多种 ISO 8601 格式
+        for fmt in [
+            "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%dT%H:%M:%S.%fZ",
+            "%Y-%m-%dT%H:%M:%S%z",
+            "%Y-%m-%dT%H:%M:%S.%f%z",
+            "%Y-%m-%d %H:%M:%S",
+        ]:
+            try:
+                dt = datetime.strptime(iso_str.replace("+00:00", "Z"), fmt.replace("%z", "Z") if "Z" in iso_str else fmt)
+                return dt.strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+        
+        # 如果上述格式都不匹配，尝试 fromisoformat（Python 3.7+）
+        iso_clean = iso_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(iso_clean)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception as e:
+        logger.debug("failed to parse datetime: %s — %s", iso_str, e)
+        return iso_str
+
+
+def _format_response_times(data: Any) -> Any:
+    """
+    递归格式化响应体中的所有时间字段。
+    """
+    if isinstance(data, dict):
+        return {k: _format_response_times(v) if not _is_time_field(k) else _format_datetime(v) if isinstance(v, str) else v for k, v in data.items()}
+    elif isinstance(data, list):
+        return [_format_response_times(item) for item in data]
+    else:
+        return data
+
+
+def _is_time_field(key: str) -> bool:
+    """判断字段名是否为时间字段。"""
+    key_lower = key.lower()
+    return any(key_lower.endswith(suffix) for suffix in TIME_FIELD_SUFFIXES)
 
 
 def _forward_headers(request: Request) -> Dict[str, str]:
@@ -131,6 +191,18 @@ async def proxy_to_sentry(base_url: str, path: str, request: Request) -> Respons
             out_headers[k] = r.headers[k]
 
     logger.info("proxy ← %s %s (status=%d content_length=%d)", request.method, url, r.status_code, len(r.content))
+    
+    # 格式化响应中的时间字段
+    if "application/json" in r.headers.get("content-type", ""):
+        try:
+            data = r.json()
+            data = _format_response_times(data)
+            content = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            out_headers["content-type"] = "application/json; charset=utf-8"
+            return Response(content=content, status_code=r.status_code, headers=out_headers)
+        except Exception as e:
+            logger.warning("failed to format response times: %s — returning original", e)
+    
     return Response(content=r.content, status_code=r.status_code, headers=out_headers)
 
 
@@ -194,4 +266,16 @@ async def proxy_to_sentry_noauth(base_url: str, path: str, request: Request) -> 
             out_headers[k] = r.headers[k]
 
     logger.info("proxy(noauth) ← %s %s (status=%d content_length=%d)", request.method, url, r.status_code, len(r.content))
+    
+    # 格式化响应中的时间字段
+    if "application/json" in r.headers.get("content-type", ""):
+        try:
+            data = r.json()
+            data = _format_response_times(data)
+            content = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            out_headers["content-type"] = "application/json; charset=utf-8"
+            return Response(content=content, status_code=r.status_code, headers=out_headers)
+        except Exception as e:
+            logger.warning("failed to format response times (noauth): %s — returning original", e)
+    
     return Response(content=r.content, status_code=r.status_code, headers=out_headers)
