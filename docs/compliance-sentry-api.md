@@ -360,7 +360,7 @@ curl -X POST /platform/compliance-sentry/v1/auth/login \
 **响应（200）：**
 
 ```json
-{ "message": "Password changed successfully" }
+{ "status": "success", "message": "密码修改成功" }
 ```
 
 ---
@@ -377,20 +377,20 @@ curl -X POST /platform/compliance-sentry/v1/auth/login \
 
 ```json
 {
-  "username": "alice",
+  "user_id": "uuid-xxxx",
   "new_password": "NewPass456"
 }
 ```
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `username` | string | 是 | 目标用户名 |
+| `user_id` | string | 是 | 目标用户的 UUID |
 | `new_password` | string | 是 | 新密码 |
 
 **响应（200）：**
 
 ```json
-{ "message": "Password changed successfully" }
+{ "status": "success", "message": "用户密码修改成功" }
 ```
 
 ---
@@ -430,25 +430,33 @@ curl -X POST /platform/compliance-sentry/v1/auth/login \
 | 参数 | 类型 | 说明 |
 |------|------|------|
 | `page` | int | 页码，默认 1 |
-| `page_size` | int | 每页数量，默认 20 |
+| `limit` | int | 每页数量，默认 20，最大 1000 |
+| `role` | string | 角色筛选：`admin` / `user` / `viewer` |
+| `search` | string | 按用户名关键词搜索 |
 
 **响应（200）：**
 
 ```json
 {
-  "users": [
-    {
-      "username": "admin",
-      "email": "admin@example.com",
-      "role": "admin",
-      "user_id": "uuid-xxxx",
-      "created_at": "2025-11-15 10:14:38",
-      "last_login": "2026-03-19 01:16:59"
+  "status": "success",
+  "data": {
+    "users": [
+      {
+        "username": "admin",
+        "email": "admin@example.com",
+        "role": "admin",
+        "user_id": "uuid-xxxx",
+        "created_at": "2025-11-15 10:14:38",
+        "last_login": "2026-03-19 01:16:59"
+      }
+    ],
+    "pagination": {
+      "current_page": 1,
+      "total_pages": 1,
+      "total_users": 1,
+      "limit": 20
     }
-  ],
-  "total": 1,
-  "page": 1,
-  "page_size": 20
+  }
 }
 ```
 
@@ -510,36 +518,56 @@ curl -X POST /platform/compliance-sentry/v1/auth/login \
 
 ### `GET /platform/compliance-sentry/v1/analysis/tasks`
 
-获取分析任务列表，支持分页与状态筛选。
+获取分析任务列表，支持分页与多维度筛选。
 
 **Query 参数：**
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
-| `page` | int | 页码，默认 1 |
-| `page_size` | int | 每页数量，默认 20 |
+| `page` | int | 页码，默认 1，最小 1 |
+| `limit` | int | 每页数量，默认 20，范围 1~100 |
 | `status` | string | 按状态筛选：`pending` / `running` / `completed` / `failed` / `terminated` |
-| `project_name` | string | 按项目名模糊搜索 |
+| `type` | string | 按任务类型筛选（如 `oh_package` / `oh_system`） |
+| `has_conflicts` | boolean | 筛选存在/不存在冲突的任务（`true` / `false`） |
+| `risk_level` | string | 按风险等级筛选 |
+| `search` | string | 按任务名关键词模糊搜索 |
+| `start_date` | string | 开始日期（Unix 时间戳秒/毫秒 或 ISO 8601 字符串） |
+| `end_date` | string | 结束日期（Unix 时间戳秒/毫秒 或 ISO 8601 字符串） |
+| `min_progress` | float | 最小进度百分比（0~100） |
+| `max_progress` | float | 最大进度百分比（0~100） |
+| `user_filter` | string | 按创建用户名筛选（**仅管理员有效**，普通用户只能查看自己的任务） |
 
 **响应（200）：**
 
 ```json
 {
-  "tasks": [
+  "status": "success",
+  "data": [
     {
-      "analysis_id": "uuid-xxxx",
-      "project_name": "my-project",
+      "id": "uuid-xxxx",
+      "task_name": "my-project",
       "status": "completed",
       "created_at": "2026-03-01 10:00:00",
       "updated_at": "2026-03-01 10:30:00",
+      "created_by": "admin",
+      "type": "oh_package",
+      "has_conflicts": false,
+      "risk_level": "unknown",
+      "target_url": null,
+      "status_message": null,
       "progress": 100
     }
   ],
-  "total": 1,
-  "page": 1,
-  "page_size": 20
+  "pagination": {
+    "current_page": 1,
+    "total_pages": 1,
+    "total_items": 1,
+    "limit": 20
+  }
 }
 ```
+
+> **权限说明**：普通用户只能查看自己创建的任务；管理员默认查看全部，可通过 `user_filter` 筛选特定用户。
 
 ---
 
@@ -553,18 +581,34 @@ curl -X POST /platform/compliance-sentry/v1/auth/login \
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `project_name` | string | 是 | 项目名称 |
-| `shadow_file` | file | 否 | shadow 文件 |
-| `license_shadow` | file | 否 | 许可证 shadow 文件 |
-| `third_party` | boolean | 否 | 是否扫描第三方依赖 |
-| `fallback_tree` | boolean | 否 | 是否启用 fallback-tree |
+| `mission_payload` | string | 是 | 任务配置 **JSON 字符串**（见下方结构说明） |
+| `file_shadow` | file | 否 | 文件级 shadow（任意类型文件） |
+| `license_shadow` | file | 否 | 许可证 shadow（**必须为 JSON 文件**） |
+
+**`mission_payload` JSON 结构：**
+
+```json
+{
+  "mission_target": {
+    "project_name": "my-project",
+    "zip_path": "/path/to/file.zip"
+  },
+  "third_party": false,
+  "fallback_tree": false,
+  "branch_tag": "main",
+  "max_depth": null
+}
+```
+
+> `mission_payload` 作为表单字段传入（字符串形式的 JSON），不是 JSON 请求体。
 
 **响应（202）：**
 
 ```json
 {
   "analysis_id": "uuid-xxxx",
-  "message": "Mission accepted and is pending execution."
+  "message": "Analysis job accepted and is pending execution.",
+  "shadow_enabled": false
 }
 ```
 
@@ -582,8 +626,11 @@ curl -X POST /platform/compliance-sentry/v1/auth/login \
 |------|------|------|------|
 | `project_name` | string | 是 | 项目名称 |
 | `file` | file | 是 | zip / tar.gz 压缩包 |
+| `file_shadow` | file | 否 | 文件级 shadow（任意类型文件） |
+| `license_shadow` | file | 否 | 许可证 shadow（**必须为 JSON 文件**） |
 | `third_party` | boolean | 否 | 是否扫描第三方依赖，默认 `false` |
 | `fallback_tree` | boolean | 否 | 是否启用 fallback-tree，默认 `false` |
+| `max_depth` | int | 否 | 第三方依赖扫描深度（可选） |
 
 **示例：**
 
@@ -606,7 +653,8 @@ const data = await res.json()
 ```json
 {
   "analysis_id": "uuid-xxxx",
-  "message": "Zip uploaded, analysis job accepted and is pending execution."
+  "message": "Zip uploaded, analysis job accepted and is pending execution.",
+  "shadow_enabled": false
 }
 ```
 
@@ -623,10 +671,13 @@ const data = await res.json()
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `project_name` | string | 是 | 项目名称 |
-| `git_url` | string | 是 | Git 仓库地址（http/https/ssh） |
+| `git_url` | string | 是 | Git 仓库地址（`http://`、`https://` 或 `git@` 开头） |
 | `branch_tag` | string | 否 | 分支或 tag，默认拉主分支 |
+| `file_shadow` | file | 否 | 文件级 shadow（任意类型文件） |
+| `license_shadow` | file | 否 | 许可证 shadow（**必须为 JSON 文件**） |
 | `third_party` | boolean | 否 | 是否扫描第三方依赖，默认 `false` |
 | `fallback_tree` | boolean | 否 | 是否启用 fallback-tree，默认 `false` |
+| `max_depth` | int | 否 | 第三方依赖扫描深度（可选） |
 
 **示例：**
 
@@ -647,7 +698,8 @@ const res = await fetch('/platform/compliance-sentry/v1/mission/git', {
 ```json
 {
   "analysis_id": "uuid-xxxx",
-  "message": "Git repo submitted, analysis job accepted and is pending execution."
+  "message": "Git repo submitted, analysis job accepted and is pending execution.",
+  "shadow_enabled": false
 }
 ```
 
@@ -1126,13 +1178,26 @@ const timer = setInterval(async () => {
 
 ### `GET /platform/compliance-sentry/v1/kb/licenses`
 
-获取知识库中所有许可证名称列表。
+获取知识库中所有许可证列表。
 
-**响应（200）：**
+**Query 参数：**
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `detailed` | boolean | 默认 `false`，只返回 `spdx_id` 和 `name`；`true` 返回完整详细信息（数据量较大） |
+
+**响应（200，`detailed=false`）：**
 
 ```json
 {
-  "licenses": ["MIT", "Apache-2.0", "GPL-2.0-only", "GPL-3.0-only", "BSD-3-Clause"]
+  "status": "success",
+  "data": {
+    "licenses": [
+      { "spdx_id": "MIT", "name": "MIT License" },
+      { "spdx_id": "Apache-2.0", "name": "Apache License 2.0" }
+    ],
+    "count": 2
+  }
 }
 ```
 
@@ -1152,14 +1217,17 @@ const timer = setInterval(async () => {
 
 ```json
 {
-  "spdx_id": "MIT",
-  "name": "MIT License",
-  "category": "Permissive",
-  "is_osi_approved": true,
-  "is_fsf_libre": true,
-  "copyleft_type": null,
-  "compatible_with": ["Apache-2.0", "GPL-2.0-only"],
-  "text_url": "https://spdx.org/licenses/MIT.html"
+  "status": "success",
+  "data": {
+    "spdx_id": "MIT",
+    "name": "MIT License",
+    "category": "Permissive",
+    "is_osi_approved": true,
+    "is_fsf_libre": true,
+    "copyleft_type": null,
+    "compatible_with": ["Apache-2.0", "GPL-2.0-only"],
+    "text_url": "https://spdx.org/licenses/MIT.html"
+  }
 }
 ```
 
@@ -1243,7 +1311,7 @@ const timer = setInterval(async () => {
 
 ### `POST /platform/compliance-sentry/v1/kb/licenses/upload`
 
-批量上传许可证文件（CSV / JSON 格式）更新知识库。
+批量上传许可证文件更新知识库。
 
 **Content-Type**：`multipart/form-data`
 
@@ -1251,16 +1319,23 @@ const timer = setInterval(async () => {
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `file` | file | 是 | CSV 或 JSON 格式的许可证数据文件 |
+| `files` | file[] | 是 | 支持多文件上传。单文件：`.json` / `.toml`；压缩包：`.zip` / `.tar` / `.tar.gz` / `.tgz` / `.tar.bz2` / `.tbz2`（自动解压） |
 
-**响应（200）：**
+> 每个许可证文件必须包含 `spdx_id` 字段作为唯一标识符。
+
+**响应状态码：**
+- `201`：全部成功
+- `207`：部分成功
+- `400`：全部失败
+
+**响应（201）：**
 
 ```json
 {
-  "message": "Licenses uploaded successfully",
-  "added": 10,
+  "created": 10,
   "updated": 3,
-  "skipped": 1
+  "skipped": 1,
+  "errors": []
 }
 ```
 
@@ -1327,14 +1402,26 @@ const timer = setInterval(async () => {
 
 ### `POST /platform/compliance-sentry/v1/kb/admin/initialize`
 
-初始化知识库（管理员），从内置数据集导入基础许可证信息。
+初始化知识库（管理员），从内置数据集导入基础许可证信息并计算兼容性关系。
+
+**Query 参数（均为可选）：**
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `load_licenses` | boolean | `true` | 是否加载许可证到数据库 |
+| `compute_compatibilities` | boolean | `true` | 是否计算兼容性关系 |
+| `force_recompute` | boolean | `false` | 是否强制重新计算已存在的兼容性关系 |
 
 **响应（200）：**
 
 ```json
 {
-  "message": "Knowledge base initialized successfully",
-  "total_licenses": 500
+  "status": "success",
+  "message": "Knowledge base initialization completed",
+  "data": {
+    "licenses_loaded": 500,
+    "compatibilities_computed": 12500
+  }
 }
 ```
 
@@ -1348,18 +1435,30 @@ const timer = setInterval(async () => {
 
 ### `GET /platform/compliance-sentry/v1/dashboard/overview`
 
-获取系统总览数据（任务总数、完成率、许可证统计等）。
+获取系统总览数据（任务总数、活跃任务、冲突数、知识库条目数）。
 
 **响应（200）：**
 
 ```json
 {
-  "total_tasks": 256,
-  "completed_tasks": 230,
-  "failed_tasks": 10,
-  "running_tasks": 3,
-  "total_licenses_detected": 45,
-  "total_conflicts_found": 120
+  "status": "success",
+  "data": {
+    "overview": {
+      "total_analysis_tasks": 256,
+      "active_tasks": 3,
+      "conflicts_count": 120,
+      "knowledge_base_entries": 500,
+      "license_entries_count": 500
+    },
+    "trends": {
+      "tasks_change": "+0%",
+      "tasks_change_type": "positive",
+      "active_tasks_change": 0,
+      "conflicts_change": 0,
+      "conflicts_change_type": "positive",
+      "knowledge_base_change": 0
+    }
+  }
 }
 ```
 
@@ -1373,10 +1472,13 @@ const timer = setInterval(async () => {
 
 ```json
 {
-  "stats": [
-    { "date": "2026-03-13", "submitted": 5, "completed": 4, "failed": 1 },
-    { "date": "2026-03-14", "submitted": 8, "completed": 8, "failed": 0 }
-  ]
+  "status": "success",
+  "data": {
+    "daily_stats": [
+      { "date": "2026-03-13", "new_tasks": 5, "completed_tasks": 4, "conflict_tasks": 1 },
+      { "date": "2026-03-14", "new_tasks": 8, "completed_tasks": 8, "conflict_tasks": 0 }
+    ]
+  }
 }
 ```
 
@@ -1384,23 +1486,27 @@ const timer = setInterval(async () => {
 
 ### `GET /platform/compliance-sentry/v1/dashboard/license-distribution`
 
-获取所有已完成任务中检测到的许可证分布统计。
+获取所有任务中检测到的许可证分布统计（按文件数聚合）。
 
 **Query 参数：**
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
-| `limit` | int | 返回前 N 个，默认 8 |
+| `limit` | int | 返回前 N 个，默认 8，范围 1~100 |
 
 **响应（200）：**
 
 ```json
 {
-  "distribution": [
-    { "license": "MIT", "count": 980, "percentage": 45.2 },
-    { "license": "Apache-2.0", "count": 560, "percentage": 25.8 },
-    { "license": "GPL-3.0-only", "count": 320, "percentage": 14.7 }
-  ]
+  "status": "success",
+  "data": {
+    "licenses": [
+      { "license": "MIT", "count": 980 },
+      { "license": "Apache-2.0", "count": 560 },
+      { "license": "GPL-3.0-only", "count": 320 }
+    ],
+    "limit": 8
+  }
 }
 ```
 
@@ -1408,19 +1514,19 @@ const timer = setInterval(async () => {
 
 ### `GET /platform/compliance-sentry/v1/dashboard/system-resources`
 
-获取当前服务器资源使用率（实时快照）。
+获取当前服务器资源使用率（实时快照，基于 psutil）。
 
 **响应（200）：**
 
 ```json
 {
-  "timestamp": "2026-03-19 10:00:00",
-  "cpu_percent": 35.2,
-  "memory_total_mb": 16384,
-  "memory_used_mb": 8192,
-  "memory_percent": 50.0,
-  "disk_total_gb": 500,
-  "disk_used_gb": 120
+  "status": "success",
+  "data": {
+    "cpu_percent": 35.2,
+    "memory_percent": 50.0,
+    "memory_total_bytes": 17179869184,
+    "memory_available_bytes": 8589934592
+  }
 }
 ```
 
@@ -1434,12 +1540,16 @@ const timer = setInterval(async () => {
 
 ```json
 {
-  "distribution": {
-    "pending": 5,
-    "running": 3,
-    "completed": 230,
-    "failed": 10,
-    "terminated": 8
+  "status": "success",
+  "data": {
+    "statuses": [
+      { "status": "pending", "count": 5 },
+      { "status": "running", "count": 3 },
+      { "status": "completed", "count": 230 },
+      { "status": "failed", "count": 10 },
+      { "status": "terminated", "count": 8 }
+    ],
+    "total_tasks": 256
   }
 }
 ```
@@ -1448,18 +1558,20 @@ const timer = setInterval(async () => {
 
 ### `GET /platform/compliance-sentry/v1/dashboard/daily-summary`
 
-获取当天的任务统计摘要。
+获取当天（零点至当前）的任务统计摘要。
 
 **响应（200）：**
 
 ```json
 {
-  "date": "2026-03-19",
-  "submitted": 12,
-  "completed": 10,
-  "failed": 1,
-  "running": 1,
-  "avg_duration_minutes": 18.5
+  "status": "success",
+  "data": {
+    "date": "2026-03-19",
+    "completed_tasks": 10,
+    "failed_tasks": 1,
+    "compatible_tasks": 8,
+    "incompatible_tasks": 2
+  }
 }
 ```
 
@@ -1479,15 +1591,34 @@ const timer = setInterval(async () => {
 
 ```json
 {
-  "status": "healthy",
-  "components": {
-    "database": "healthy",
-    "redis": "healthy",
-    "rabbitmq": "healthy",
-    "celery_worker": "healthy"
-  },
-  "version": "1.0.0",
-  "uptime_seconds": 86400
+  "status": "success",
+  "data": {
+    "status": "healthy",
+    "components": {
+      "database": {
+        "status": "healthy",
+        "response_time_ms": 10,
+        "connection_pool": { "active": 5, "idle": 10, "max": 20 }
+      },
+      "message_queue": {
+        "status": "healthy",
+        "queue_length": 0,
+        "consumers": 1
+      },
+      "analysis_engine": {
+        "status": "healthy",
+        "active_tasks": 0,
+        "queue_size": 0
+      }
+    },
+    "metrics": {
+      "uptime_seconds": 3600,
+      "total_requests": 1000,
+      "successful_requests": 980,
+      "failed_requests": 20,
+      "avg_response_time_ms": 150
+    }
+  }
 }
 ```
 
@@ -1501,9 +1632,16 @@ const timer = setInterval(async () => {
 
 ```json
 {
-  "max_concurrent_tasks": 10,
-  "max_queue_size": 100,
-  "task_timeout_seconds": 86400
+  "status": "success",
+  "data": {
+    "max_app_concurrent_tasks": 10,
+    "max_system_concurrent_tasks": 5,
+    "max_tasks_per_user": 3,
+    "celery_min_concurrency": 1,
+    "celery_max_concurrency": 10,
+    "active_app_tasks": 2,
+    "active_system_tasks": 0
+  }
 }
 ```
 
@@ -1519,16 +1657,17 @@ const timer = setInterval(async () => {
 
 ```json
 {
-  "max_concurrent_tasks": 5,
-  "max_queue_size": 50
+  "max_app_concurrent_tasks": 8,
+  "max_system_concurrent_tasks": 4,
+  "max_tasks_per_user": 2,
+  "celery_min_concurrency": 1,
+  "celery_max_concurrency": 8
 }
 ```
 
-**响应（200）：**
+> `0` 或负数表示不限制；`celery_max_concurrency` 不能小于 `celery_min_concurrency`。
 
-```json
-{ "message": "Task limits updated successfully" }
-```
+**响应（200）：** 同 GET，返回更新后的完整配置。
 
 ---
 
@@ -1540,42 +1679,43 @@ const timer = setInterval(async () => {
 
 ### `GET /platform/compliance-sentry/v1/conflicts/search`
 
-跨任务全局搜索许可证冲突记录。
+搜索许可证冲突记录，支持多维度筛选。
 
 **Query 参数：**
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
-| `license_a` | string | 第一个许可证 SPDX ID（模糊匹配） |
-| `license_b` | string | 第二个许可证 SPDX ID（模糊匹配） |
-| `project_name` | string | 按项目名筛选 |
+| `q` | string | 搜索关键词 |
+| `severity` | string | 风险等级筛选，默认 `all` |
+| `license` | string | 许可证筛选 |
+| `status` | string | 状态筛选，默认 `all` |
 | `page` | int | 页码，默认 1 |
-| `page_size` | int | 每页数量，默认 20 |
+| `limit` | int | 每页数量，默认 20，最大 100 |
 
 **示例：**
 
 ```http
-GET /platform/compliance-sentry/v1/conflicts/search?license_a=GPL&page=1&page_size=10
+GET /platform/compliance-sentry/v1/conflicts/search?q=GPL&severity=high&page=1&limit=10
 ```
 
 **响应（200）：**
 
 ```json
 {
-  "conflicts": [
-    {
-      "analysis_id": "uuid-xxxx",
-      "project_name": "my-app",
-      "package_a": "pkg-a@1.0.0",
-      "license_a": "MIT",
-      "package_b": "pkg-c@3.0.0",
-      "license_b": "GPL-3.0-only",
-      "conflict_reason": "Copyleft conflict"
-    }
-  ],
-  "total": 1,
-  "page": 1,
-  "page_size": 20
+  "status": "success",
+  "data": [],
+  "pagination": {
+    "current_page": 1,
+    "total_pages": 0,
+    "total_items": 0,
+    "limit": 20
+  },
+  "summary": {
+    "total_conflicts": 0,
+    "high_severity": 0,
+    "medium_severity": 0,
+    "low_severity": 0
+  }
 }
 ```
 
@@ -1603,13 +1743,23 @@ GET /platform/compliance-sentry/v1/conflicts/search?license_a=GPL&page=1&page_si
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `file_shadow` | file | 否 | 文件 shadow（覆盖式上传） |
-| `license_shadow` | file | 否 | 许可证 shadow |
+| `shadow_file` | file | 否 | 文件 shadow（任意类型，覆盖式上传） |
+| `license_shadow` | file | 否 | 许可证 shadow（**必须为 JSON 文件**，gzip+base64 压缩入库） |
+| `config` | file | 否 | 配置文件（**必须为 JSON 文件**，gzip+base64 压缩入库） |
 
 **响应（200）：**
 
 ```json
-{ "message": "Files uploaded successfully" }
+{
+  "code": 0,
+  "status": "success",
+  "message": "Files uploaded/updated successfully",
+  "data": {
+    "file_shadow": "/path/to/shadow_file__xxx",
+    "license_shadow": true,
+    "config": true
+  }
+}
 ```
 
 ---
@@ -1628,9 +1778,11 @@ GET /platform/compliance-sentry/v1/conflicts/search?license_a=GPL&page=1&page_si
 
 ```json
 {
-  "task_id": "uuid-xxxx",
-  "filename": "file_shadow",
-  "content_base64": "SGVsbG8gV29ybGQ..."
+  "code": 0,
+  "status": "success",
+  "data": {
+    "base64": "SGVsbG8gV29ybGQ..."
+  }
 }
 ```
 
@@ -1638,7 +1790,7 @@ GET /platform/compliance-sentry/v1/conflicts/search?license_a=GPL&page=1&page_si
 
 ### `GET /platform/compliance-sentry/v1/tasks/{task_id}/files/base64/license_shadow`
 
-获取任务 `license_shadow` 文件的 Base64 编码内容。
+获取任务 `license_shadow` 文件的 Base64 编码内容（gzip 压缩后的 base64）。
 
 **路径参数：**
 
@@ -1646,13 +1798,23 @@ GET /platform/compliance-sentry/v1/conflicts/search?license_a=GPL&page=1&page_si
 |------|------|
 | `task_id` | 任务 UUID |
 
-**响应（200）：** 同 `file_shadow`，`filename` 为 `license_shadow`。
+**响应（200）：**
+
+```json
+{
+  "code": 0,
+  "status": "success",
+  "data": {
+    "base64": "H4sIAAAAAAAAA..."
+  }
+}
+```
 
 ---
 
 ### `GET /platform/compliance-sentry/v1/tasks/{task_id}/files/base64/config`
 
-获取任务 `config` 文件的 Base64 编码内容。
+获取任务 `config` 文件的 Base64 编码内容（gzip 压缩后的 base64）。
 
 **路径参数：**
 
@@ -1660,7 +1822,17 @@ GET /platform/compliance-sentry/v1/conflicts/search?license_a=GPL&page=1&page_si
 |------|------|
 | `task_id` | 任务 UUID |
 
-**响应（200）：** 同 `file_shadow`，`filename` 为 `config`。
+**响应（200）：**
+
+```json
+{
+  "code": 0,
+  "status": "success",
+  "data": {
+    "base64": "H4sIAAAAAAAAA..."
+  }
+}
+```
 
 ---
 
@@ -1678,8 +1850,11 @@ GET /platform/compliance-sentry/v1/conflicts/search?license_a=GPL&page=1&page_si
 
 ```json
 {
-  "task_id": "uuid-xxxx",
-  "keys": ["key-a", "key-b", "key-c"]
+  "code": 0,
+  "status": "success",
+  "data": {
+    "keys": ["key-a", "key-b", "key-c"]
+  }
 }
 ```
 
@@ -1699,7 +1874,14 @@ GET /platform/compliance-sentry/v1/conflicts/search?license_a=GPL&page=1&page_si
 **响应（200）：**
 
 ```json
-{ "message": "Key deleted successfully" }
+{
+  "code": 0,
+  "status": "success",
+  "message": "Key deleted (if existed)",
+  "data": {
+    "keys": ["key-b", "key-c"]
+  }
+}
 ```
 
 ---
