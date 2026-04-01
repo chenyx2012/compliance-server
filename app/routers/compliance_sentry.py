@@ -911,3 +911,67 @@ def platform_task_result(task_id: str) -> Dict[str, Any]:
     if r.state == "FAILURE":
         return {"task_id": task_id, "state": r.state, "error": str(r.result)}
     return {"task_id": task_id, "state": r.state, "result": r.result}
+
+
+# ===========================================================================
+# 网关内部管理  /platform/admin/...
+# ===========================================================================
+
+import app.services.sentry_auth as _sentry_auth_module
+
+
+@router.post(
+    "/platform/admin/sentry-token/clear",
+    summary="清除网关缓存的 sentry token（下次请求时自动重新登录）",
+    tags=["platform-admin"],
+)
+async def admin_clear_sentry_token() -> Dict[str, Any]:
+    """将内存中缓存的 sentry token 清空，使网关在下一次代理请求时强制重新登录获取新 token。"""
+    _sentry_auth_module._token = None
+    _sentry_auth_module._token_expires_at = 0.0
+    logger.info("admin: sentry token cache cleared manually")
+    return {"status": "success", "message": "sentry token cache cleared, will re-login on next request"}
+
+
+@router.post(
+    "/platform/admin/sentry-token/refresh",
+    summary="强制立即刷新网关缓存的 sentry token",
+    tags=["platform-admin"],
+)
+async def admin_refresh_sentry_token() -> Dict[str, Any]:
+    """立即向 sentry 重新登录并更新内存缓存，返回新 token 的过期时间戳。"""
+    try:
+        await get_token(force_refresh=True)
+        import time as _time
+        expires_at = _sentry_auth_module._token_expires_at
+        remaining = max(0.0, expires_at - _time.monotonic())
+        logger.info("admin: sentry token refreshed manually, remaining=%.0fs", remaining)
+        return {
+            "status": "success",
+            "message": "sentry token refreshed successfully",
+            "expires_in_seconds": int(remaining),
+        }
+    except Exception as e:
+        logger.error("admin: sentry token refresh failed — %s", e)
+        raise HTTPException(status_code=502, detail=f"sentry re-login failed: {e}")
+
+
+@router.get(
+    "/platform/admin/sentry-token/status",
+    summary="查看当前网关缓存的 sentry token 状态",
+    tags=["platform-admin"],
+)
+async def admin_sentry_token_status() -> Dict[str, Any]:
+    """返回当前缓存 token 是否有效、剩余有效秒数。"""
+    import time as _time
+    has_token = bool(_sentry_auth_module._token)
+    expires_at = _sentry_auth_module._token_expires_at
+    remaining = max(0.0, expires_at - _time.monotonic()) if has_token else 0.0
+    margin = _sentry_auth_module._TOKEN_MARGIN_SECONDS
+    is_valid = has_token and remaining > margin
+    return {
+        "has_token": has_token,
+        "is_valid": is_valid,
+        "expires_in_seconds": int(remaining),
+        "margin_seconds": margin,
+    }
