@@ -25,7 +25,7 @@ from app.core.config import settings
 from app.core.database import get_db, init_db
 from app.models.file_ingest import FileIngestResult
 from app.schemas.scan import ScanRequest
-from app.routers import compliance_sentry
+from app.routers import compliance_sentry, platform_tasks
 from app.services.file_ingest import ingest_from_upload, ingest_from_url
 from app.services.tasks import MODULES, _run_scan_async, scan_task
 
@@ -41,6 +41,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
 app.include_router(compliance_sentry.router)
+app.include_router(platform_tasks.router)
 
 
 # 请求日志中间件

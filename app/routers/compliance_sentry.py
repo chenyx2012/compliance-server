@@ -38,6 +38,7 @@ from app.core.celery_app import celery_app
 from app.core.config import settings
 from app.core.database import get_db
 from app.models.file_ingest import FileIngestResult
+from app.models.platform_task import PlatformTask, derive_task_status
 from app.services.file_ingest import ingest_from_upload, ingest_from_url
 from app.services.platform_tasks import sentry_mission_task
 from app.services.sentry_auth import get_token
@@ -55,6 +56,44 @@ def _sentry_base() -> str:
     if not settings.compliance_sentry_base_url:
         raise HTTPException(status_code=503, detail="COMPLIANCE_SENTRY_BASE_URL not configured")
     return settings.compliance_sentry_base_url
+
+
+async def _update_platform_task_s3(
+    db: AsyncSession,
+    platform_task_id: str,
+    s3_status: str,
+) -> None:
+    """
+    按 platform_task_id 查找主任务，更新 s3_status 并重新推导 task_status。
+    找不到记录时仅打日志，不抛异常（避免阻断主流程）。
+    """
+    from datetime import datetime, timezone
+    from sqlalchemy import select as _select
+
+    try:
+        result = await db.execute(
+            _select(PlatformTask).where(PlatformTask.task_id == platform_task_id)
+        )
+        pt = result.scalar_one_or_none()
+        if pt is None:
+            logger.warning(
+                "_update_platform_task_s3 — platform_task_id=%s not found, skip",
+                platform_task_id,
+            )
+            return
+        pt.s3_status = s3_status
+        pt.task_status = derive_task_status(pt)
+        pt.updated_at = datetime.now(timezone.utc)
+        await db.flush()
+        logger.info(
+            "_update_platform_task_s3 — platform_task_id=%s s3_status=%s task_status=%s",
+            platform_task_id, s3_status, pt.task_status,
+        )
+    except Exception as exc:
+        logger.error(
+            "_update_platform_task_s3 — failed to update platform_task_id=%s: %s",
+            platform_task_id, exc,
+        )
 
 
 # ===========================================================================
@@ -191,8 +230,28 @@ async def sentry_analyze_client(request: Request):
     summary="[sentry] 删除分析任务",
     tags=["sentry-analysis"],
 )
-async def sentry_analysis_delete(analysis_id: str, request: Request):
-    return await proxy_to_sentry(_sentry_base(), f"analysis/{analysis_id}", request)
+async def sentry_analysis_delete(
+    analysis_id: str,
+    request: Request,
+    platform_task_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    删除 sentry 分析任务并透传响应。
+    若提供 platform_task_id，删除成功后将主任务的 s3_status 更新为 failed，
+    task_status 同步重新推导（表示该扫描服务已被中止/删除）。
+    """
+    resp = await proxy_to_sentry(_sentry_base(), f"analysis/{analysis_id}", request)
+    if platform_task_id:
+        # 判断转发是否成功（2xx）——proxy_to_sentry 返回 Response 对象
+        status_code = getattr(resp, "status_code", 200)
+        if status_code < 300:
+            await _update_platform_task_s3(db, platform_task_id, "failed")
+            logger.info(
+                "sentry_analysis_delete — analysis_id=%s platform_task_id=%s s3→failed",
+                analysis_id, platform_task_id,
+            )
+    return resp
 
 
 @router.post(
@@ -705,8 +764,28 @@ async def platform_tasks(
         ingest_id, task_name, source_type, source_label[:50] if source_label else "N/A", s3_status
     )
 
+    # --- 创建平台任务记录 ---
+    services_set = set(services_norm)
+    pt = PlatformTask(
+        task_name=task_name,
+        ingest_id=ingest_id,
+        s1_status="pending" if "S1" in services_set else "skipped",
+        s2_status="pending" if "S2" in services_set else "skipped",
+        s3_status="pending" if "S3" in services_set else "skipped",
+        s4_status="pending" if "S4" in services_set else "skipped",
+        s5_status="pending" if "S5" in services_set else "skipped",
+    )
+    db.add(pt)
+    await db.flush()
+    platform_task_id = pt.task_id
+    logger.info(
+        "platform_tasks — task record created — platform_task_id=%s ingest_id=%d task_name=%s services=%s",
+        platform_task_id, ingest_id, task_name, services_norm,
+    )
+
     out: Dict[str, Any] = {
         "status": "success",
+        "platform_task_id": platform_task_id,
         "ingest_id": ingest_id,
         "meta": meta,
         "tree": tree,
@@ -761,6 +840,7 @@ async def platform_tasks(
                     "branch_tag": branch_tag,
                     "temp_shadow_path": temp_shadow_path,
                     "temp_license_shadow_path": temp_license_shadow_path,
+                    "platform_task_id": platform_task_id,
                 },
             )
             out["sentry_async"] = True
@@ -769,6 +849,7 @@ async def platform_tasks(
                 "platform_tasks — submitted to sentry async (git) — ingest_id=%d task_name=%s celery_task_id=%s git_url=%s",
                 ingest_id, task_name, ar.id, source_url.strip()
             )
+            # running 状态和轮询由 sentry_mission_task 内部在获得 analysis_id 后写库
             return out
         base = settings.compliance_sentry_base_url.rstrip("/") + "/api/v1"
         form_git = {
@@ -806,11 +887,22 @@ async def platform_tasks(
                 "platform_tasks — sentry sync failed (git) — ingest_id=%d task_name=%s status=%d body=%s",
                 ingest_id, task_name, r.status_code, str(sentry_body)[:300]
             )
+            await _update_platform_task_s3(db, platform_task_id, "failed")
         else:
+            analysis_id = sentry_body.get("analysis_id")
             logger.info(
-                "platform_tasks — sentry sync success (git) — ingest_id=%d task_name=%s analysis_id=%s",
-                ingest_id, task_name, sentry_body.get("analysis_id", "N/A")
+                "platform_tasks — sentry sync accepted (git) — ingest_id=%d task_name=%s analysis_id=%s",
+                ingest_id, task_name, analysis_id or "N/A"
             )
+            # sentry 返回 202 表示已接受，扫描在 sentry 后台异步进行 → running
+            await _update_platform_task_s3(db, platform_task_id, "running")
+            # 启动轮询 task，等 sentry 扫描完成后写库
+            if analysis_id:
+                from app.services.platform_tasks import sentry_poll_task, _POLL_INTERVAL
+                sentry_poll_task.apply_async(
+                    kwargs={"analysis_id": analysis_id, "platform_task_id": platform_task_id},
+                    countdown=_POLL_INTERVAL,
+                )
         return out
 
     # file path — need zip for mission/upload
@@ -852,6 +944,7 @@ async def platform_tasks(
                 "branch_tag": None,
                 "temp_shadow_path": temp_shadow_path,
                 "temp_license_shadow_path": temp_license_shadow_path,
+                "platform_task_id": platform_task_id,
             },
         )
         out["sentry_async"] = True
@@ -860,6 +953,7 @@ async def platform_tasks(
             "platform_tasks — submitted to sentry async (upload) — ingest_id=%d task_name=%s celery_task_id=%s file=%s",
             ingest_id, task_name, ar.id, upload_filename
         )
+        # running 状态和轮询由 sentry_mission_task 内部在获得 analysis_id 后写库
         return out
 
     base = settings.compliance_sentry_base_url.rstrip("/") + "/api/v1"
@@ -890,12 +984,22 @@ async def platform_tasks(
             "platform_tasks — sentry sync failed (upload) — ingest_id=%d task_name=%s status=%d body=%s",
             ingest_id, task_name, r.status_code, str(sentry_body)[:300]
         )
+        await _update_platform_task_s3(db, platform_task_id, "failed")
     else:
+        analysis_id = sentry_body.get("analysis_id")
         logger.info(
-            "platform_tasks — sentry sync success (upload) — ingest_id=%d task_name=%s analysis_id=%s",
-            ingest_id, task_name, sentry_body.get("analysis_id", "N/A")
+            "platform_tasks — sentry sync accepted (upload) — ingest_id=%d task_name=%s analysis_id=%s",
+            ingest_id, task_name, analysis_id or "N/A"
         )
-    return out 
+        # sentry 返回 202 表示已接受，扫描在 sentry 后台异步进行 → running
+        await _update_platform_task_s3(db, platform_task_id, "running")
+        if analysis_id:
+            from app.services.platform_tasks import sentry_poll_task, _POLL_INTERVAL
+            sentry_poll_task.apply_async(
+                kwargs={"analysis_id": analysis_id, "platform_task_id": platform_task_id},
+                countdown=_POLL_INTERVAL,
+            )
+    return out
 
 
 @router.get(
