@@ -19,7 +19,8 @@
 - `app/schemas/scan.py`：扫描请求/响应模型
 - `app/core/database.py`：MySQL 异步连接与会话
 - `app/models/file_ingest.py`：文件解析结果表模型（目录树 + meta 入库）
-- `docs/compliance-sentry-api.md`：compliance-sentry 接口对接完整说明
+- `docs/compliance-sentry-api.md`：compliance-sentry 接口对接完整说明（含 `POST /platform/tasks` 参数说明）
+- `docs/platform-api.md`：平台自有接口说明（首页看板、任务查询、OAT 规则配置、S1 扫描取消）
 
 ## 依赖
 
@@ -231,9 +232,15 @@ const data = await res.json();
 
 ### 4) 平台任务总入口 & compliance-sentry 全量接口
 
-包括鉴权流程、`POST /platform/tasks`（文件入库 + 扫描触发）、异步任务轮询、以及 compliance-sentry 全部模块（analysis、mission、kb、dashboard、system、conflicts、task_assets 等）的代理接口说明，详见：
+包括鉴权流程、`POST /platform/tasks`（文件入库 + S1/S3 扫描触发）、异步任务轮询、以及 compliance-sentry 全部模块代理接口说明，详见：
 
 **[docs/compliance-sentry-api.md](docs/compliance-sentry-api.md)**
+
+### 5) 平台自有接口（首页看板 / 任务查询 / OAT 规则管理）
+
+首页看板数据、平台任务多条件查询、OAT 规则配置 CRUD、S1 扫描结果查询与取消，详见：
+
+**[docs/platform-api.md](docs/platform-api.md)**
 
 ## 下游服务约定（四模块通用）
 

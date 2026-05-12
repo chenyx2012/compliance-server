@@ -21,6 +21,8 @@
 - [配置项](#配置项)
 - [错误响应](#错误响应)
 
+> **平台自有接口**（看板、任务查询、OAT 规则管理）文档见：[platform-api.md](platform-api.md)
+
 ---
 
 ## 鉴权流程
@@ -79,118 +81,119 @@ const taskRes = await fetch('/platform/tasks', {
 
 ## 平台任务总入口（`POST /platform/tasks`）
 
-文件入库 + 可选触发 compliance-sentry 扫描的统一入口，支持同步与异步两种模式。
+文件入库 + 可选触发多项扫描服务的统一入口，支持同步与异步两种模式。
 
 **Content-Type**：`multipart/form-data`
 
 **请求头**：无需携带 `Authorization`，网关自动处理鉴权
 
+### 扫描服务说明
+
+| `services` 值 | 服务 | 说明 |
+|---------------|------|------|
+| `S1` | OAT 开源合规扫描 | 调用内置 `oat_python`，可配置自定义规则 |
+| `S3` | compliance-sentry | 依赖图解析与许可证兼容性检测 |
+| `S2` / `S4` | 预留 | 占位，当前 skipped |
+
 ### 请求参数
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `task_name` | string | 是 | 任务/项目名称（提交 sentry 时作为 mission 名称） |
-| `services` | string[] | 是 | `S1`/`S2`/`S3`/`S4` 多选；其中 `S3`=compliance-sentry |
-| `async_scan` | boolean | 否 | `false`（默认，同步等待 sentry 返回）或 `true`（Celery 异步，立即返回 `platform_task_id`） |
+| `task_name` | string | 是 | 任务/项目名称 |
+| `services` | string[] | 是 | 扫描服务多选，见上表；多值需多次 `append` 或逗号分隔 |
+| `async_scan` | boolean | 否 | `false`（默认，同步等待）或 `true`（Celery 异步，立即返回） |
 | `source_url` | string | 二选一 | Git 仓库地址（与 `file` 二选一） |
-| `file` | file | 二选一 | 上传文件（zip/tar.gz/tgz；提交 sentry 时必须为 zip/tar.gz） |
-| `third_party` | boolean | 否 | 是否启用第三方依赖扫描，透传给 sentry，默认 `false` |
-| `fallback_tree` | boolean | 否 | 是否启用 fallback-tree 解析，透传给 sentry，默认 `false` |
-| `branch_tag` | string | 否 | Git 分支或 tag 名（仅 git 任务有效） |
-| `shadow_file` | file | 否 | compliance-sentry mission 的 shadow 文件 |
-| `license_shadow` | file | 否 | compliance-sentry mission 的 license shadow 文件 |
+| `file` | file | 二选一 | 上传 zip/tar.gz/tgz（与 `source_url` 二选一） |
+| `third_party` | boolean | 否 | 是否扫描第三方依赖（透传 S3），默认 `false` |
+| `fallback_tree` | boolean | 否 | 是否启用 fallback-tree（透传 S3），默认 `false` |
+| `branch_tag` | string | 否 | Git 分支或 tag（仅 git 任务有效） |
+| `shadow_file` | file | 否 | S3（compliance-sentry）的 shadow 文件 |
+| `license_shadow` | file | 否 | S3（compliance-sentry）的 license shadow 文件 |
+| `s1_rule_config_id` | integer | 否 | **S1 专用**：使用的 OAT 规则配置 ID（来自 `/platform/oat-rules`）；不传则使用 oat_python 内置默认规则 |
 
-### 示例：上传 zip 文件并同步扫描
+### 示例：同时触发 S1 + S3 同步扫描（上传 zip）
 
 ```javascript
 const form = new FormData()
 form.append('task_name', 'my-project')
+form.append('services', 'S1')
 form.append('services', 'S3')
 form.append('async_scan', 'false')
-form.append('file', zipFile)  // File 对象
+form.append('file', zipFile)
+form.append('s1_rule_config_id', '2')  // 可选：指定 OAT 规则配置
 
-const res = await fetch('/platform/tasks', {
-  method: 'POST',
-  body: form   // 无需 Authorization 头，网关自动鉴权
-})
+const res = await fetch('/platform/tasks', { method: 'POST', body: form })
 const data = await res.json()
-// data.ingest_id                    — 目录树入库 ID
-// data.sentry.body.analysis_id      — sentry 分析任务 ID
+// data.s1.total_issues       — OAT 扫描 issue 总数
+// data.sentry.body.analysis_id — sentry 分析任务 ID
 ```
 
-### 示例：Git 地址异步扫描
+### 示例：仅 S1 异步扫描（Git 地址）
 
 ```javascript
 const form = new FormData()
 form.append('task_name', 'my-project')
-form.append('services', 'S3')
+form.append('services', 'S1')
 form.append('async_scan', 'true')
 form.append('source_url', 'https://github.com/owner/repo.git')
 
-const res = await fetch('/platform/tasks', {
-  method: 'POST',
-  body: form
-})
+const res = await fetch('/platform/tasks', { method: 'POST', body: form })
 const data = await res.json()
-// data.platform_task_id — 用于轮询的 Celery task ID
+// data.s1_celery_task_id — S1 Celery 任务 ID（可用 GET /platform/tasks/{id}/s1/... 轮询）
+// 状态变化：platform_task.s1_status  pending → running → success/failed
 ```
 
 ### 响应结构
 
-**同步模式（`async_scan=false`）：**
+**同步模式（S1 + S3 均成功）：**
 
 ```json
 {
   "status": "success",
+  "platform_task_id": "pt-xxxxxxxxxxxx",
   "ingest_id": 42,
-  "meta": {
-    "source": "upload",
-    "type": "archive",
-    "filename": "project.zip",
-    "s3_upload": "Success"
-  },
+  "meta": { "source": "upload", "type": "archive", "filename": "project.zip" },
   "tree": { "path": "project", "next": {}, "content": null },
-  "services": ["S3"],
-  "service": "compliance-sentry",
+  "services": ["S1", "S3"],
+  "s1": {
+    "status": "success",
+    "total_issues": 3,
+    "invalid_file_type_count": 0,
+    "license_header_invalid_count": 2,
+    "copyright_header_invalid_count": 1,
+    "rule_config_id": null
+  },
   "sentry": {
     "status_code": 202,
-    "body": {
-      "analysis_id": "uuid-xxxx",
-      "message": "Zip uploaded, analysis job accepted and is pending execution."
-    }
+    "body": { "analysis_id": "uuid-xxxx", "message": "..." }
   }
 }
 ```
 
-**同步模式（sentry 失败）：**
-
-```json
-{
-  "status": "error",
-  "ingest_id": 42,
-  "meta": { "..." : "..." },
-  "tree": { "..." : "..." },
-  "services": ["S3"],
-  "service": "compliance-sentry",
-  "sentry": { "status_code": 500, "body": { "error": "..." } },
-  "error": { "error": "..." }
-}
-```
-
-**异步模式（`async_scan=true`）：**
+**异步模式（`async_scan=true`，包含 S1 + S3）：**
 
 ```json
 {
   "status": "success",
+  "platform_task_id": "pt-xxxxxxxxxxxx",
   "ingest_id": 42,
-  "meta": { "..." : "..." },
-  "tree": { "..." : "..." },
-  "services": ["S3"],
-  "service": "compliance-sentry",
-  "sentry_async": true,
-  "platform_task_id": "celery-task-uuid"
+  "services": ["S1", "S3"],
+  "s1_async": true,
+  "s1_celery_task_id": "celery-task-uuid-s1",
+  "sentry_async": true
 }
 ```
+
+**`s1` 字段说明：**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `status` | string | `success` / `failed` |
+| `total_issues` | integer | 三类 issue 之和 |
+| `invalid_file_type_count` | integer | 二进制/归档文件类型问题数 |
+| `license_header_invalid_count` | integer | License 头缺失/不合规数 |
+| `copyright_header_invalid_count` | integer | Copyright 头缺失/不合规数 |
+| `rule_config_id` | integer \| null | 使用的规则配置 ID，null 表示内置默认 |
 
 ---
 
