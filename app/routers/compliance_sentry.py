@@ -23,6 +23,7 @@ compliance-sentry-main 全量接口对接路由。
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import tempfile
@@ -38,8 +39,10 @@ from app.core.celery_app import celery_app
 from app.core.config import settings
 from app.core.database import get_db
 from app.models.file_ingest import FileIngestResult
+from app.models.oat_scan_result import OatScanResult
 from app.models.platform_task import PlatformTask, derive_task_status
 from app.services.file_ingest import ingest_from_upload, ingest_from_url
+from app.services.oat_scanner import oat_scan_task, run_oat_scan
 from app.services.platform_tasks import sentry_mission_task
 from app.services.sentry_auth import get_token
 from app.services.sentry_proxy import proxy_to_sentry, proxy_to_sentry_noauth
@@ -671,16 +674,16 @@ async def compliance_sentry_proxy_fallback(path: str, request: Request):
 
 @router.post(
     "/platform/tasks",
-    summary="平台任务总入口（文件入库 + 可选触发 sentry 扫描）",
+    summary="平台任务总入口（文件入库 + 可选触发 sentry/OAT 扫描）",
     tags=["platform"],
 )
 async def platform_tasks(
     task_name: str = Form(..., description="任务名称（提交 sentry 必填）"),
     services: List[str] = Form(
         ...,
-        description="扫描服务多选：S1/S2/S3/S4；其中 S3=compliance-sentry",
+        description="扫描服务多选：S1/S2/S3/S4；S1=OAT合规扫描，S3=compliance-sentry",
     ),
-    async_scan: bool = Form(False, description="为 true 时 sentry 提交走 Celery，立即返回 task_id"),
+    async_scan: bool = Form(False, description="为 true 时各服务提交走 Celery，立即返回 task_id"),
     source_url: Optional[str] = Form(None, description="Git 仓库地址（与 file 二选一）"),
     file: Optional[UploadFile] = File(None, description="上传 zip 等（与 source_url 二选一）"),
     third_party: bool = Form(False),
@@ -688,12 +691,20 @@ async def platform_tasks(
     branch_tag: Optional[str] = Form(None, description="git 任务可选分支"),
     shadow_file: Optional[UploadFile] = File(None, description="compliance-sentry mission 的 shadow_file"),
     license_shadow: Optional[UploadFile] = File(None, description="compliance-sentry mission 的 license_shadow"),
+    s1_rule_config_id: Optional[int] = Form(
+        None,
+        description=(
+            "S1（OAT）扫描使用的规则配置 ID（来自 /platform/oat-rules）。"
+            "不传则使用 oat_python 内置默认规则。"
+        ),
+    ),
     db: AsyncSession = Depends(get_db),
 ) -> Dict[str, Any]:
     """
     平台任务总入口（支持异步）：
     1. 根据 file 或 source_url 拉取代码并解析目录树，写入 MySQL（ingest_id）；
-    2. 若 services 包含 `S3`（compliance-sentry）：再向 sentry 提交 mission/upload（zip）或 mission/git（仓库地址）。
+    2. 若 services 包含 `S1`（OAT）：对源码执行开源合规扫描，支持自定义规则；
+    3. 若 services 包含 `S3`（compliance-sentry）：再向 sentry 提交 mission/upload（zip）或 mission/git（仓库地址）。
     """
     services_norm = []
     for s in services:
@@ -712,12 +723,15 @@ async def platform_tasks(
     if not services_norm:
         raise HTTPException(status_code=400, detail="services must not be empty")
 
-    want_s3 = "S3" in set(services_norm)
+    services_set = set(services_norm)
+    want_s1 = "S1" in services_set
+    want_s3 = "S3" in services_set
 
     logger.info(
-        "platform_tasks start — task_name=%s services=%s want_s3=%s async_scan=%s source_url=%s file=%s",
+        "platform_tasks start — task_name=%s services=%s want_s1=%s want_s3=%s async_scan=%s source_url=%s file=%s",
         task_name,
         services_norm,
+        want_s1,
         want_s3,
         async_scan,
         source_url,
@@ -765,7 +779,6 @@ async def platform_tasks(
     )
 
     # --- 创建平台任务记录 ---
-    services_set = set(services_norm)
     pt = PlatformTask(
         task_name=task_name,
         ingest_id=ingest_id,
@@ -794,8 +807,28 @@ async def platform_tasks(
         "service": "compliance-sentry" if want_s3 else "none",
     }
 
+    # ===========================================================================
+    # S1：OAT 开源合规扫描
+    # ===========================================================================
+    if want_s1:
+        await _handle_s1_scan(
+            out=out,
+            platform_task_id=platform_task_id,
+            task_name=task_name,
+            source_url=source_url,
+            file_bytes=file_bytes,
+            upload_filename=upload_filename,
+            branch_tag=branch_tag,
+            s1_rule_config_id=s1_rule_config_id,
+            async_scan=async_scan,
+            db=db,
+        )
+
     if not want_s3:
-        logger.info("platform_tasks complete (no compliance-sentry) — ingest_id=%d task_name=%s services=%s", ingest_id, task_name, services_norm)
+        logger.info(
+            "platform_tasks complete (no compliance-sentry) — ingest_id=%d task_name=%s services=%s",
+            ingest_id, task_name, services_norm,
+        )
         return out
 
     if not settings.compliance_sentry_base_url:
@@ -1079,3 +1112,199 @@ async def admin_sentry_token_status() -> Dict[str, Any]:
         "expires_in_seconds": int(remaining),
         "margin_seconds": margin,
     }
+
+
+# ===========================================================================
+# S1 OAT 扫描辅助函数
+# ===========================================================================
+
+async def _handle_s1_scan(
+    *,
+    out: Dict[str, Any],
+    platform_task_id: str,
+    task_name: str,
+    source_url: Optional[str],
+    file_bytes: Optional[bytes],
+    upload_filename: str,
+    branch_tag: Optional[str],
+    s1_rule_config_id: Optional[int],
+    async_scan: bool,
+    db,
+) -> None:
+    """
+    处理 S1（OAT）扫描逻辑，结果写入 out 字典。
+
+    状态流转（platform_task.s1_status）：
+      pending → running（开始扫描前立即写库，让前端可轮询看到进行中状态）
+             → success（扫描完成且 oat 无异常）
+             → failed（扫描异常/超时/oat 返回错误）
+
+    异步模式（async_scan=True）：投递 Celery 任务后立即返回，Celery 负责所有状态更新。
+    同步模式（async_scan=False）：
+      - 文件上传：从 file_bytes 解压到临时目录后扫描；
+      - Git 地址：重新浅克隆到临时目录后扫描。
+    """
+    import shutil
+    import tempfile
+    from datetime import datetime, timezone
+    from pathlib import Path
+    from sqlalchemy import select as _select
+
+    from app.models.oat_rule_config import OatRuleConfig
+    from app.models.oat_scan_result import OatScanResult
+    from app.models.platform_task import PlatformTask, derive_task_status
+
+    async def _set_s1_status(status: str) -> None:
+        """在当前 DB session 中更新 platform_task.s1_status。"""
+        res = await db.execute(
+            _select(PlatformTask).where(PlatformTask.task_id == platform_task_id)
+        )
+        pt = res.scalar_one_or_none()
+        if pt is not None:
+            pt.s1_status = status
+            pt.task_status = derive_task_status(pt)
+            pt.updated_at = datetime.now(timezone.utc)
+        await db.flush()
+
+    # ------------------------------------------------------------------
+    # 异步模式：投递 Celery 任务（Celery task 内部负责 running→终态）
+    # ------------------------------------------------------------------
+    if async_scan:
+        if source_url and source_url.strip():
+            ar = oat_scan_task.apply_async(
+                kwargs={
+                    "mode": "git",
+                    "project_name": task_name,
+                    "platform_task_id": platform_task_id,
+                    "rule_config_id": s1_rule_config_id,
+                    "git_url": source_url.strip(),
+                    "branch_tag": branch_tag,
+                },
+            )
+        else:
+            fname_lower = upload_filename.lower()
+            suffix = ".tar.gz" if (fname_lower.endswith(".tar.gz") or fname_lower.endswith(".tgz")) else ".zip"
+            import os as _os
+            fd, tmp_zip = tempfile.mkstemp(suffix=suffix)
+            _os.close(fd)
+            Path(tmp_zip).write_bytes(file_bytes or b"")
+            ar = oat_scan_task.apply_async(
+                kwargs={
+                    "mode": "upload",
+                    "project_name": task_name,
+                    "platform_task_id": platform_task_id,
+                    "rule_config_id": s1_rule_config_id,
+                    "temp_zip_path": tmp_zip,
+                },
+            )
+        out["s1_async"] = True
+        out["s1_celery_task_id"] = ar.id
+        logger.info(
+            "_handle_s1_scan — async submitted — platform_task_id=%s celery_task_id=%s",
+            platform_task_id, ar.id,
+        )
+        return
+
+    # ------------------------------------------------------------------
+    # 同步模式
+    # 步骤 1：立即标记 running，让前端查询到进行中状态
+    # ------------------------------------------------------------------
+    await _set_s1_status("running")
+
+    # 步骤 2：预插入 running 状态的 oat_scan_result 记录
+    result_row = OatScanResult(
+        platform_task_id=platform_task_id,
+        rule_config_id=s1_rule_config_id,
+        status="running",
+    )
+    db.add(result_row)
+    await db.flush()
+
+    # 步骤 3：读取规则 XML
+    rule_xml_content: Optional[str] = None
+    if s1_rule_config_id is not None:
+        cfg_res = await db.execute(
+            _select(OatRuleConfig).where(OatRuleConfig.id == s1_rule_config_id)
+        )
+        cfg_row = cfg_res.scalar_one_or_none()
+        if cfg_row is not None:
+            rule_xml_content = cfg_row.xml_content
+        else:
+            logger.warning(
+                "_handle_s1_scan — rule_config_id=%d not found, using builtin defaults",
+                s1_rule_config_id,
+            )
+
+    src_tmp: Optional[str] = None
+    try:
+        src_tmp = tempfile.mkdtemp(prefix="oat_src_")
+        src_tmp_path = Path(src_tmp)
+
+        if source_url and source_url.strip():
+            from app.services.oat_scanner import _clone_repo_sync
+            source_dir = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: _clone_repo_sync(source_url.strip(), src_tmp_path, branch_tag=branch_tag),
+            )
+        else:
+            from app.services.oat_scanner import _extract_archive_to, _pick_single_root
+            extract_dir = src_tmp_path / "extract"
+            extract_dir.mkdir()
+            archive_path = src_tmp_path / (upload_filename or "upload.zip")
+            archive_path.write_bytes(file_bytes or b"")
+            _extract_archive_to(archive_path, extract_dir)
+            source_dir = _pick_single_root(extract_dir)
+
+        # 步骤 4：执行扫描
+        scan_result = await run_oat_scan(
+            source_dir,
+            task_name,
+            rule_xml_content=rule_xml_content,
+        )
+
+        scan_error = scan_result.get("error")
+        s1_new_status = "failed" if scan_error else "success"
+
+        # 步骤 5：更新 oat_scan_result 为终态
+        result_row.status = s1_new_status
+        result_row.exit_code = scan_result.get("exit_code")
+        result_row.total_issues = scan_result.get("total_issues", 0)
+        result_row.invalid_file_type_count = scan_result.get("invalid_file_type_count", 0)
+        result_row.license_header_invalid_count = scan_result.get("license_header_invalid_count", 0)
+        result_row.copyright_header_invalid_count = scan_result.get("copyright_header_invalid_count", 0)
+        result_row.report_text = (scan_result.get("report_text") or "")[:65535]
+        result_row.error_message = scan_error
+        result_row.updated_at = datetime.now(timezone.utc)
+
+        # 步骤 6：更新 platform_task.s1_status 为终态
+        await _set_s1_status(s1_new_status)
+
+        out["s1"] = {
+            "status": s1_new_status,
+            "total_issues": scan_result.get("total_issues", 0),
+            "invalid_file_type_count": scan_result.get("invalid_file_type_count", 0),
+            "license_header_invalid_count": scan_result.get("license_header_invalid_count", 0),
+            "copyright_header_invalid_count": scan_result.get("copyright_header_invalid_count", 0),
+            "rule_config_id": s1_rule_config_id,
+        }
+        logger.info(
+            "_handle_s1_scan sync done — platform_task_id=%s status=%s total_issues=%d",
+            platform_task_id, s1_new_status, scan_result.get("total_issues", 0),
+        )
+
+    except Exception as exc:
+        logger.error(
+            "_handle_s1_scan sync error — platform_task_id=%s error=%s",
+            platform_task_id, exc,
+        )
+        out["s1"] = {"status": "failed", "error": str(exc)}
+        try:
+            result_row.status = "failed"
+            result_row.error_message = str(exc)[:2000]
+            result_row.updated_at = datetime.now(timezone.utc)
+            await _set_s1_status("failed")
+        except Exception:
+            pass
+    finally:
+        if src_tmp:
+            shutil.rmtree(src_tmp, ignore_errors=True)

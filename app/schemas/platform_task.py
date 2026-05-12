@@ -87,3 +87,25 @@ class ServiceStatusUpdateResponse(BaseModel):
     service_status: ServiceStatus
     task_status: TaskStatus
     updated_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# 首页看板
+# ---------------------------------------------------------------------------
+
+class MonitorProjectStats(BaseModel):
+    """监控项目统计指标（支持环比）。"""
+
+    current: int = Field(..., description="本月总数")
+    last_month: int = Field(..., description="上月总数")
+    change: int = Field(..., description="环比变化量（本月 - 上月）")
+    change_rate: Optional[float] = Field(
+        None, description="环比变化率（百分比，上月为 0 时为 null）"
+    )
+
+
+class DashboardResponse(BaseModel):
+    """首页看板汇总数据。"""
+
+    month: str = Field(..., description="当前统计月份，格式 YYYY-MM")
+    monitor_projects: MonitorProjectStats = Field(..., description="监控项目数统计")

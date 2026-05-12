@@ -1,6 +1,7 @@
 """
 平台任务管理接口。
 
+  GET  /platform/dashboard                首页看板（监控项目总数 + 环比）
   GET  /platform/tasks/query              任务多条件查询（分页）
   GET  /platform/tasks/{task_id}          根据 task_id 查询单条任务
   PATCH /platform/tasks/{task_id}/service-status   扫描服务回调更新状态
@@ -19,6 +20,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.models.platform_task import PlatformTask, derive_task_status
 from app.schemas.platform_task import (
+    DashboardResponse,
+    MonitorProjectStats,
     PlatformTaskListResponse,
     PlatformTaskResponse,
     ServiceStatusUpdateRequest,
@@ -29,6 +32,86 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["platform-tasks"])
 
 
+# ===========================================================================
+# GET /platform/dashboard  — 首页看板
+# ===========================================================================
+
+@router.get(
+    "/platform/dashboard",
+    response_model=DashboardResponse,
+    summary="首页看板：监控项目总数及环比涨跌",
+    tags=["platform-dashboard"],
+)
+async def platform_dashboard(
+    db: AsyncSession = Depends(get_db),
+) -> DashboardResponse:
+    """
+    返回首页看板核心指标：
+
+    - **monitor_projects.current**     : 本月（自然月）新增监控项目数
+    - **monitor_projects.last_month**  : 上月新增监控项目数
+    - **monitor_projects.change**      : 环比变化量（本月 - 上月）
+    - **monitor_projects.change_rate** : 环比变化率（%），上月为 0 时返回 null
+
+    统计口径：`platform_task` 表中 `task_status != 'deleted'` 的记录，
+    按 `created_at` 所在自然月分组计数。
+    """
+    now = datetime.now(timezone.utc)
+    # 本月第一天 00:00:00 UTC
+    this_month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    # 上月第一天
+    if this_month_start.month == 1:
+        last_month_start = this_month_start.replace(year=this_month_start.year - 1, month=12)
+    else:
+        last_month_start = this_month_start.replace(month=this_month_start.month - 1)
+
+    base_filter = PlatformTask.task_status != "deleted"
+
+    current_count_result = await db.execute(
+        select(func.count())
+        .select_from(PlatformTask)
+        .where(
+            and_(
+                base_filter,
+                PlatformTask.created_at >= this_month_start,
+            )
+        )
+    )
+    current_count: int = current_count_result.scalar_one()
+
+    last_month_count_result = await db.execute(
+        select(func.count())
+        .select_from(PlatformTask)
+        .where(
+            and_(
+                base_filter,
+                PlatformTask.created_at >= last_month_start,
+                PlatformTask.created_at < this_month_start,
+            )
+        )
+    )
+    last_month_count: int = last_month_count_result.scalar_one()
+
+    change = current_count - last_month_count
+    change_rate: Optional[float] = (
+        round(change / last_month_count * 100, 2) if last_month_count != 0 else None
+    )
+
+    month_str = now.strftime("%Y-%m")
+    logger.info(
+        "platform_dashboard — month=%s current=%d last_month=%d change=%d change_rate=%s",
+        month_str, current_count, last_month_count, change, change_rate,
+    )
+
+    return DashboardResponse(
+        month=month_str,
+        monitor_projects=MonitorProjectStats(
+            current=current_count,
+            last_month=last_month_count,
+            change=change,
+            change_rate=change_rate,
+        ),
+    )
 
 
 # ===========================================================================
