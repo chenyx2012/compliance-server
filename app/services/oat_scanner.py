@@ -593,26 +593,86 @@ def _pick_single_root(extract_dir: Path) -> Path:
     return extract_dir
 
 
+def _kill_process_tree_sync(pid: Optional[int]) -> None:
+    """
+    同步版：强制终止进程树（Windows / Unix 双平台）。
+    Windows 下 subprocess 的 timeout 处理只杀父进程，子进程（如 git-remote-https.exe）
+    会变成孤儿，持有临时目录句柄，导致清理失败和下次 clone 报错。
+    """
+    if pid is None:
+        return
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                timeout=10,
+            )
+        else:
+            import signal
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    except Exception as e:
+        logger.debug("_kill_process_tree_sync pid=%d error=%s", pid, e)
+
+
 def _clone_repo_sync(
     git_url: str,
     dest_parent: Path,
     branch_tag: Optional[str] = None,
 ) -> Path:
-    """同步浅克隆仓库到 dest_parent/<repo_name>，返回克隆目录。"""
-    import subprocess
+    """
+    同步浅克隆仓库到 dest_parent/<repo_name>，返回克隆目录。
 
+    容错处理：
+    - 若目标目录已存在（上次崩溃/超时残留），先清除再克隆。
+    - 超时时调用 _kill_process_tree_sync() 杀掉整个子进程树，
+      并清理残留目录，防止下次克隆同一仓库报错。
+    """
     repo_name = git_url.rstrip("/").split("/")[-1].removesuffix(".git") or "repo"
     dest = dest_parent / repo_name
-    dest.mkdir(parents=True, exist_ok=True)
+
+    # 若目录已存在（残留），先清理，让 git 自己创建
+    if dest.exists():
+        logger.warning("_clone_repo_sync — dest already exists, removing — dest=%s", dest)
+        shutil.rmtree(dest, ignore_errors=True)
 
     cmd = ["git", "clone", "--depth", "1", "--single-branch"]
     if branch_tag:
         cmd += ["--branch", branch_tag]
     cmd += [git_url, str(dest)]
 
+    extra: Dict[str, Any] = {}
+    if sys.platform != "win32":
+        extra["start_new_session"] = True
+
     logger.info("_clone_repo_sync — url=%s dest=%s", git_url, dest)
-    result = subprocess.run(cmd, capture_output=True, timeout=300)
-    if result.returncode != 0:
-        err = (result.stderr or result.stdout or b"").decode("utf-8", errors="replace")
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        **extra,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=300)
+    except subprocess.TimeoutExpired:
+        logger.error("_clone_repo_sync timeout — url=%s", git_url)
+        _kill_process_tree_sync(proc.pid)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        shutil.rmtree(dest, ignore_errors=True)
+        raise RuntimeError("git clone timeout")
+    except Exception:
+        _kill_process_tree_sync(proc.pid)
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
+
+    if proc.returncode != 0:
+        err = (stderr or stdout or b"").decode("utf-8", errors="replace")
+        shutil.rmtree(dest, ignore_errors=True)
         raise RuntimeError(f"git clone failed: {err[:500]}")
     return dest

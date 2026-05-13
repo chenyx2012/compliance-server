@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import os
+import shutil
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -13,6 +16,29 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _kill_process_tree(pid: int) -> None:
+    """
+    强制终止进程及其所有子进程（Windows / Unix 双平台）。
+    Windows 下 proc.kill() 只杀父进程，子进程（如 git-remote-https.exe）会变成孤儿进程
+    并继续持有临时目录的文件句柄，导致后续清理失败和再次 clone 出错。
+    """
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                timeout=10,
+            )
+        else:
+            import signal
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    except Exception as e:
+        logger.debug("_kill_process_tree pid=%d error=%s", pid, e)
 
 DEFAULT_IGNORE_DIRS = {
     ".git",
@@ -53,28 +79,57 @@ async def _clone_repo(git_url: str, dest_dir: Path, *, timeout_seconds: int = 30
     """
     将 git 仓库 clone 到 dest_dir，返回仓库根目录（即 dest_dir 本身）。
     git_url 支持带 .git 和不带两种；使用浅克隆 --depth 1。
+
+    容错处理：
+    - 若 dest_dir 已存在（上次崩溃/超时留下的残留目录），先彻底清除再克隆，
+      避免 git 报 "destination already exists and is not an empty directory"。
+    - 超时或失败时调用 _kill_process_tree() 杀掉整个子进程树（包括
+      git-remote-https.exe 等孙进程），防止孤儿进程持有文件句柄导致临时
+      目录无法删除，进而影响下一次克隆。
     """
+    # 若目录已存在（残留），先清理，让 git 自己创建
+    if dest_dir.exists():
+        logger.warning("git clone — dest already exists, removing — dest=%s", dest_dir)
+        shutil.rmtree(dest_dir, ignore_errors=True)
+
+    dest_dir.parent.mkdir(parents=True, exist_ok=True)
+
     logger.info("git clone start — url=%s dest=%s timeout=%ds", git_url, dest_dir, timeout_seconds)
-    dest_dir.mkdir(parents=True, exist_ok=True)
+    kwargs: Dict[str, Any] = {}
+    if sys.platform != "win32":
+        kwargs["start_new_session"] = True  # 让子进程独立进程组，便于整组 kill
+
     cmd = ["git", "clone", "--depth", "1", "--single-branch", git_url, str(dest_dir)]
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        **kwargs,
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
     except asyncio.TimeoutError:
         logger.error("git clone timeout — url=%s timeout=%ds", git_url, timeout_seconds)
-        proc.kill()
-        await proc.wait()
+        _kill_process_tree(proc.pid)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            pass
+        # 超时后清理残留目录，防止下次请求 clone 同一仓库时出错
+        shutil.rmtree(dest_dir, ignore_errors=True)
         raise ValueError("git clone timeout")
-    
+    except Exception:
+        _kill_process_tree(proc.pid)
+        shutil.rmtree(dest_dir, ignore_errors=True)
+        raise
+
     if proc.returncode != 0:
         err = (stderr or stdout or b"").decode("utf-8", errors="replace").strip()
         logger.error("git clone failed — url=%s returncode=%d stderr=%s", git_url, proc.returncode, err[:500])
+        # 失败时也清理，避免残留半成品目录
+        shutil.rmtree(dest_dir, ignore_errors=True)
         raise ValueError(f"git clone failed: {err}")
-    
+
     logger.info("git clone success — url=%s dest=%s", git_url, dest_dir)
     return dest_dir
 
