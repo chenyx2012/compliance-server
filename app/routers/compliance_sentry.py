@@ -65,9 +65,11 @@ async def _update_platform_task_s3(
     db: AsyncSession,
     platform_task_id: str,
     s3_status: str,
+    analysis_id: Optional[str] = None,
 ) -> None:
     """
     按 platform_task_id 查找主任务，更新 s3_status 并重新推导 task_status。
+    若传入 analysis_id，同时写入 platform_task.s3_analysis_id。
     找不到记录时仅打日志，不抛异常（避免阻断主流程）。
     """
     from datetime import datetime, timezone
@@ -85,12 +87,14 @@ async def _update_platform_task_s3(
             )
             return
         pt.s3_status = s3_status
+        if analysis_id:
+            pt.s3_analysis_id = analysis_id
         pt.task_status = derive_task_status(pt)
         pt.updated_at = datetime.now(timezone.utc)
         await db.flush()
         logger.info(
-            "_update_platform_task_s3 — platform_task_id=%s s3_status=%s task_status=%s",
-            platform_task_id, s3_status, pt.task_status,
+            "_update_platform_task_s3 — platform_task_id=%s s3_status=%s analysis_id=%s task_status=%s",
+            platform_task_id, s3_status, analysis_id or "N/A", pt.task_status,
         )
     except Exception as exc:
         logger.error(
@@ -928,7 +932,8 @@ async def platform_tasks(
                 ingest_id, task_name, analysis_id or "N/A"
             )
             # sentry 返回 202 表示已接受，扫描在 sentry 后台异步进行 → running
-            await _update_platform_task_s3(db, platform_task_id, "running")
+            # 同时将 analysis_id 写入 platform_task.s3_analysis_id
+            await _update_platform_task_s3(db, platform_task_id, "running", analysis_id)
             # 启动轮询 task，等 sentry 扫描完成后写库
             if analysis_id:
                 from app.services.platform_tasks import sentry_poll_task, _POLL_INTERVAL
@@ -1025,7 +1030,8 @@ async def platform_tasks(
             ingest_id, task_name, analysis_id or "N/A"
         )
         # sentry 返回 202 表示已接受，扫描在 sentry 后台异步进行 → running
-        await _update_platform_task_s3(db, platform_task_id, "running")
+        # 同时将 analysis_id 写入 platform_task.s3_analysis_id
+        await _update_platform_task_s3(db, platform_task_id, "running", analysis_id)
         if analysis_id:
             from app.services.platform_tasks import sentry_poll_task, _POLL_INTERVAL
             sentry_poll_task.apply_async(

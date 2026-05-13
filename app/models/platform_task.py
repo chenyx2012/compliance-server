@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import DateTime, Integer, String
+from sqlalchemy import Boolean, DateTime, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -71,6 +71,19 @@ class PlatformTask(Base):
         default=None,
         index=True,
         comment="compliance-sentry analysis_id，由 mission 提交后写入，用于轮询扫描进度",
+    )
+    # sentry 扫描结果摘要（扫描完成后写入）
+    s3_has_conflicts: Mapped[Optional[bool]] = mapped_column(
+        Boolean,
+        nullable=True,
+        default=None,
+        comment="S3 扫描是否检测到许可证冲突（sentry has_conflicts）；NULL 表示未获取到",
+    )
+    s3_conflict_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        comment="S3 扫描检测到的许可证冲突数量",
     )
 
     # -----------------------------------------------------------------------

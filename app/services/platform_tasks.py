@@ -293,10 +293,15 @@ def _update_platform_task_s3_sync(
     platform_task_id: str,
     s3_status: str,
     analysis_id: Optional[str] = None,
+    has_conflicts: Optional[bool] = None,
+    conflict_count: int = 0,
 ) -> None:
     """
     同步（Celery worker 上下文）更新 platform_task 的 s3_status 和 task_status。
     使用 SQLAlchemy 同步引擎，避免在 Celery 中引入 asyncio。
+
+    has_conflicts / conflict_count：扫描完成时从 sentry conflicts 接口获取后传入；
+    不传（默认 None）时不覆盖 DB 中已有值。
     """
     from sqlalchemy import create_engine, select
     from sqlalchemy.orm import sessionmaker
@@ -323,14 +328,17 @@ def _update_platform_task_s3_sync(
             pt.s3_status = s3_status
             if analysis_id:
                 pt.s3_analysis_id = analysis_id
+            if has_conflicts is not None:
+                pt.s3_has_conflicts = has_conflicts
+                pt.s3_conflict_count = conflict_count
             pt.task_status = derive_task_status(pt)
             pt.updated_at = datetime.now(timezone.utc)
             session.commit()
             logger.info(
-                "_update_platform_task_s3_sync — platform_task_id=%s s3_status=%s task_status=%s",
-                platform_task_id,
-                s3_status,
-                pt.task_status,
+                "_update_platform_task_s3_sync — platform_task_id=%s s3_status=%s "
+                "has_conflicts=%s conflict_count=%d task_status=%s",
+                platform_task_id, s3_status,
+                has_conflicts, conflict_count, pt.task_status,
             )
     except Exception as exc:
         logger.error(
@@ -418,18 +426,69 @@ def sentry_poll_task(
         analysis_id, current_status, progress,
     )
 
-    # 终态处理
+    # 终态处理：completed → success，顺带拉取冲突数
     if current_status == "completed":
-        _update_platform_task_s3_sync(platform_task_id, "success", analysis_id)
+        has_conflicts: Optional[bool] = None
+        conflict_count: int = 0
+        try:
+            rc = httpx.get(
+                f"{base}/analysis/{analysis_id}/conflicts",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=30.0,
+                proxy=_proxy,
+            )
+            if rc.is_success:
+                conflicts_body = rc.json()
+                conflict_list = conflicts_body.get("conflicts", [])
+                conflict_count = len(conflict_list)
+                has_conflicts = conflict_count > 0
+                logger.info(
+                    "sentry_poll_task — fetched conflicts — analysis_id=%s count=%d",
+                    analysis_id, conflict_count,
+                )
+            else:
+                logger.warning(
+                    "sentry_poll_task — conflicts endpoint returned %d, skipping — analysis_id=%s",
+                    rc.status_code, analysis_id,
+                )
+        except Exception as ce:
+            logger.warning(
+                "sentry_poll_task — failed to fetch conflicts, will store without — "
+                "analysis_id=%s error=%s",
+                analysis_id, ce,
+            )
+        try:
+            _update_platform_task_s3_sync(
+                platform_task_id, "success", analysis_id,
+                has_conflicts=has_conflicts,
+                conflict_count=conflict_count,
+            )
+        except Exception as db_exc:
+            logger.error(
+                "sentry_poll_task — DB update failed for completed status, will retry — "
+                "analysis_id=%s platform_task_id=%s error=%s",
+                analysis_id, platform_task_id, db_exc,
+            )
+            raise self.retry(exc=db_exc, countdown=_POLL_INTERVAL)
         return {
             "status": "success",
             "analysis_id": analysis_id,
             "platform_task_id": platform_task_id,
             "current_status": current_status,
+            "conflict_count": conflict_count,
         }
 
+    # 终态处理：failed / terminated → failed
     if current_status in ("failed", "terminated"):
-        _update_platform_task_s3_sync(platform_task_id, "failed", analysis_id)
+        try:
+            _update_platform_task_s3_sync(platform_task_id, "failed", analysis_id)
+        except Exception as db_exc:
+            logger.error(
+                "sentry_poll_task — DB update failed for failed/terminated status, will retry — "
+                "analysis_id=%s platform_task_id=%s error=%s",
+                analysis_id, platform_task_id, db_exc,
+            )
+            raise self.retry(exc=db_exc, countdown=_POLL_INTERVAL)
         return {
             "status": "failed",
             "analysis_id": analysis_id,
@@ -439,12 +498,18 @@ def sentry_poll_task(
 
     # 仍在 pending / running → 继续轮询
     if self.request.retries >= _POLL_MAX_RETRIES - 1:
-        # 超出最大重试，标记超时失败
         logger.error(
             "sentry_poll_task — polling timeout — analysis_id=%s platform_task_id=%s",
             analysis_id, platform_task_id,
         )
-        _update_platform_task_s3_sync(platform_task_id, "failed", analysis_id)
+        try:
+            _update_platform_task_s3_sync(platform_task_id, "failed", analysis_id)
+        except Exception as db_exc:
+            logger.error(
+                "sentry_poll_task — DB update failed on timeout — "
+                "analysis_id=%s platform_task_id=%s error=%s",
+                analysis_id, platform_task_id, db_exc,
+            )
         return {
             "status": "timeout",
             "analysis_id": analysis_id,

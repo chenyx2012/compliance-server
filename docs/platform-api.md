@@ -1,38 +1,116 @@
 # 平台自有接口说明
 
-本文档说明合规平台网关（compliance_sever）的**平台自有接口**，包括：
+本文档说明合规平台网关（compliance_sever）的**平台自有接口**，包括任务提交、首页看板、任务管理和 OAT 规则配置。
 
-- [首页看板](#首页看板get-platformdashboard)
-- [平台任务管理](#平台任务管理)
+---
+
+## 目录
+
+- [平台任务总入口](#平台任务总入口post-platformtasks)
+- **首页看板**
+  - [监控项目总数](#监控项目总数get-platformdashboard)
+  - [总体风险数](#总体风险数get-platformdashboardrisk-overview)
+  - [待处理扫描任务数](#待处理扫描任务数get-platformdashboardpending-risks)
+  - [最近 6 个月合规趋势](#最近-6-个月合规趋势get-platformdashboardcompliance-trend)
+- **平台任务管理**
   - [多条件查询](#多条件查询get-platformtasksquery)
   - [查询单条任务](#查询单条任务get-platformtaskstask_id)
   - [服务状态回调](#服务状态回调patch-platformtaskstask_idservice-status)
-- [OAT 规则配置管理](#oat-规则配置管理)
+  - [实时同步 S3 状态](#实时同步-s3-状态post-platformtaskstask_ids3sync-status)
+- **OAT 规则配置**
   - [列出规则配置](#列出规则配置get-platformoat-rules)
   - [创建规则配置](#创建规则配置post-platformoat-rules)
   - [查看内置默认 XML](#查看内置默认-xmlget-platformoat-rulesbuiltin-xml)
   - [获取单条规则](#获取单条规则get-platformoat-rulesrule_id)
   - [更新规则配置](#更新规则配置put-platformoat-rulesrule_id)
   - [删除规则配置](#删除规则配置delete-platformoat-rulesrule_id)
-- [OAT 扫描结果](#oat-扫描结果)
+- **OAT 扫描结果**
   - [查询扫描结果](#查询扫描结果get-platformoat-scan-resultstask_id)
   - [取消 S1 扫描](#取消-s1-扫描delete-platformtaskstask_ids1)
+- [数据模型参考](#数据模型参考)
 
 ---
 
-## 首页看板（`GET /platform/dashboard`）
+## 平台任务总入口（`POST /platform/tasks`）
 
-获取首页看板核心指标：监控项目总数及环比涨跌。
+文件入库 + 触发多项扫描服务的统一入口，支持同步与异步两种模式。
 
-**统计口径**：`platform_task` 表中 `task_status != 'deleted'` 的记录，按 `created_at` 所在自然月计数。
+**Content-Type**：`multipart/form-data`
 
-### 请求
+### 扫描服务说明
 
-```http
-GET /platform/dashboard
+| `services` 值 | 服务 | 说明 |
+|--------------|------|------|
+| `S1` | OAT 开源合规扫描 | 调用内置 `oat_python`，可配置自定义规则 |
+| `S3` | compliance-sentry | 依赖图解析与许可证兼容性检测 |
+| `S2` / `S4` | 预留 | 占位，当前 skipped |
+
+### 请求参数
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `task_name` | string | 是 | 任务/项目名称 |
+| `services` | string[] | 是 | 扫描服务多选，多值需多次 `append` 或逗号分隔 |
+| `async_scan` | boolean | 否 | `false`（默认，同步等待）或 `true`（Celery 异步，立即返回） |
+| `source_url` | string | 二选一 | Git 仓库地址（与 `file` 二选一） |
+| `file` | file | 二选一 | 上传 zip/tar.gz/tgz（与 `source_url` 二选一） |
+| `third_party` | boolean | 否 | 是否扫描第三方依赖（透传 S3），默认 `false` |
+| `fallback_tree` | boolean | 否 | 是否启用 fallback-tree（透传 S3），默认 `false` |
+| `branch_tag` | string | 否 | Git 分支或 tag（仅 git 任务有效） |
+| `shadow_file` | file | 否 | S3（compliance-sentry）的 shadow 文件 |
+| `license_shadow` | file | 否 | S3（compliance-sentry）的 license shadow 文件 |
+| `s1_rule_config_id` | integer | 否 | **S1 专用**：OAT 规则配置 ID（来自 `/platform/oat-rules`）；不传则使用 oat_python 内置默认规则 |
+
+### 响应结构
+
+**同步模式（S1 + S3 均成功）：**
+
+```json
+{
+  "status": "success",
+  "platform_task_id": "pt-a1b2c3d4...",
+  "ingest_id": 42,
+  "meta": { "source": "upload", "type": "archive", "filename": "project.zip" },
+  "tree": { "path": "project", "next": {}, "content": null },
+  "services": ["S1", "S3"],
+  "s1": {
+    "status": "success",
+    "total_issues": 3,
+    "invalid_file_type_count": 0,
+    "license_header_invalid_count": 2,
+    "copyright_header_invalid_count": 1,
+    "rule_config_id": null
+  },
+  "sentry": {
+    "status_code": 202,
+    "body": { "analysis_id": "uuid-xxxx", "message": "..." }
+  }
+}
 ```
 
-无请求参数。
+**异步模式（`async_scan=true`）：**
+
+```json
+{
+  "status": "success",
+  "platform_task_id": "pt-a1b2c3d4...",
+  "ingest_id": 42,
+  "services": ["S1", "S3"],
+  "s1_async": true,
+  "s1_celery_task_id": "celery-task-uuid",
+  "sentry_async": true
+}
+```
+
+> S3 扫描状态变化：`pending → running → success/failed`。sentry 接受任务后网关立即设为 `running`，后台轮询（或调用 `POST sync-status`）在完成后更新终态。
+
+---
+
+## 监控项目总数（`GET /platform/dashboard`）
+
+本月监控项目数与上月环比。
+
+**统计口径**：`platform_task` 表中 `task_status != 'deleted'` 的记录，按 `created_at` 所在自然月计数。
 
 ### 响应（200）
 
@@ -48,37 +126,166 @@ GET /platform/dashboard
 }
 ```
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `month` | string | 当前统计月份，格式 `YYYY-MM` |
-| `monitor_projects.current` | integer | 本月新增监控项目数 |
-| `monitor_projects.last_month` | integer | 上月监控项目数 |
-| `monitor_projects.change` | integer | 环比变化量（本月 - 上月），正为增，负为减 |
-| `monitor_projects.change_rate` | number \| null | 环比变化率（%），保留 2 位小数；**上月为 0 时返回 `null`** |
+| 字段 | 说明 |
+|------|------|
+| `monitor_projects.current` | 本月新增监控项目数 |
+| `monitor_projects.last_month` | 上月监控项目数 |
+| `monitor_projects.change` | 环比变化量（正为增，负为减） |
+| `monitor_projects.change_rate` | 环比变化率（%），上月为 0 时返回 `null` |
 
-### 前端调用示例
+---
+
+## 总体风险数（`GET /platform/dashboard/risk-overview`）
+
+本月与上月各子服务检测到风险的任务数及环比。
+
+**风险定义：**
+
+| 服务 | 风险判断条件 | 数据来源 |
+|------|-------------|---------|
+| S1 (OAT) | `oat_scan_result.status = 'success'` 且 `total_issues > 0` | `oat_scan_result` 表 |
+| S3 (sentry) | `s3_status = 'success'` 且 `s3_has_conflicts = true` | `platform_task` 表 |
+| S2 / S4 / S5 | 预留，恒为 0，`integrated: false` | — |
+
+### 响应（200）
+
+```json
+{
+  "month": "2026-05",
+  "total": {
+    "current": 15,
+    "last_month": 10,
+    "change": 5,
+    "change_rate": 50.0,
+    "integrated": true
+  },
+  "by_service": {
+    "s1": { "current": 8, "last_month": 6, "change": 2,  "change_rate": 33.33, "integrated": true  },
+    "s2": { "current": 0, "last_month": 0, "change": 0,  "change_rate": null,  "integrated": false },
+    "s3": { "current": 7, "last_month": 4, "change": 3,  "change_rate": 75.0,  "integrated": true  },
+    "s4": { "current": 0, "last_month": 0, "change": 0,  "change_rate": null,  "integrated": false },
+    "s5": { "current": 0, "last_month": 0, "change": 0,  "change_rate": null,  "integrated": false }
+  }
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `current` | 本月风险任务数 |
+| `last_month` | 上月风险任务数 |
+| `change` | 环比变化量 |
+| `change_rate` | 环比变化率（%），上月为 0 时为 `null` |
+| `integrated` | 服务是否已接入，`false` 表示预留占位 |
+
+> `s3_has_conflicts` 在 S3 扫描完成时由 `sentry_poll_task` 或 `POST /platform/tasks/{id}/s3/sync-status` 自动写入。
+
+---
+
+## 待处理扫描任务数（`GET /platform/dashboard/pending-risks`）
+
+本月与上月各子服务处于 `pending` 或 `running` 状态（尚未得出结果）的任务数及环比，反映队列积压情况。
+
+### 响应（200）
+
+```json
+{
+  "month": "2026-05",
+  "total": {
+    "current": 5,
+    "last_month": 3,
+    "change": 2,
+    "change_rate": 66.67,
+    "integrated": true
+  },
+  "by_service": {
+    "s1": { "current": 3, "last_month": 2, "change": 1, "change_rate": 50.0,  "integrated": true  },
+    "s2": { "current": 0, "last_month": 0, "change": 0, "change_rate": null,  "integrated": false },
+    "s3": { "current": 2, "last_month": 1, "change": 1, "change_rate": 100.0, "integrated": true  },
+    "s4": { "current": 0, "last_month": 0, "change": 0, "change_rate": null,  "integrated": false },
+    "s5": { "current": 0, "last_month": 0, "change": 0, "change_rate": null,  "integrated": false }
+  }
+}
+```
+
+响应字段与 `risk-overview` 完全一致，含义对应为"待处理任务数"而非"风险数"。
+
+---
+
+## 最近 6 个月合规趋势（`GET /platform/dashboard/compliance-trend`）
+
+最近 6 个自然月（含当前月份）每月扫描总量与风险占比，用于折线/柱状图展示。
+
+### 响应（200）
+
+```json
+{
+  "months": [
+    {
+      "month": "2025-12",
+      "total_scans": 20,
+      "risk_count": 8,
+      "risk_rate": 40.0,
+      "by_service": {
+        "s1": { "scans": 10, "risks": 4 },
+        "s2": { "scans": 0,  "risks": 0 },
+        "s3": { "scans": 10, "risks": 4 },
+        "s4": { "scans": 0,  "risks": 0 },
+        "s5": { "scans": 0,  "risks": 0 }
+      }
+    },
+    { "month": "2026-01", "total_scans": 18, "risk_count": 5,  "risk_rate": 27.78, "by_service": { "...": "..." } },
+    { "month": "2026-02", "total_scans": 22, "risk_count": 9,  "risk_rate": 40.91, "by_service": { "...": "..." } },
+    { "month": "2026-03", "total_scans": 30, "risk_count": 12, "risk_rate": 40.0,  "by_service": { "...": "..." } },
+    { "month": "2026-04", "total_scans": 25, "risk_count": 10, "risk_rate": 40.0,  "by_service": { "...": "..." } },
+    {
+      "month": "2026-05",
+      "total_scans": 15,
+      "risk_count": 7,
+      "risk_rate": 46.67,
+      "by_service": {
+        "s1": { "scans": 8, "risks": 4 },
+        "s2": { "scans": 0, "risks": 0 },
+        "s3": { "scans": 7, "risks": 3 },
+        "s4": { "scans": 0, "risks": 0 },
+        "s5": { "scans": 0, "risks": 0 }
+      }
+    }
+  ]
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `total_scans` | 当月所有服务合计完成扫描数（success + failed） |
+| `risk_count` | 其中检测到风险的任务数 |
+| `risk_rate` | 风险占比（%），当月无扫描时为 `null` |
+| `by_service.s*.scans` | 该服务当月完成扫描数 |
+| `by_service.s*.risks` | 该服务当月风险任务数 |
+
+**数据来源：**
+
+| 服务 | 完成扫描判断 | 风险判断 |
+|------|------------|---------|
+| S1 | `oat_scan_result` 有记录（任务参与了 S1 扫描） | `total_issues > 0` AND `status='success'` |
+| S3 | `s3_status IN ('success','failed')` | `s3_status='success'` AND `s3_has_conflicts=true` |
+| S2/S4/S5 | 预留，恒为 0 | 预留，恒为 0 |
+
+**前端示例（ECharts）：**
 
 ```javascript
-const res = await fetch('/platform/dashboard')
-const { month, monitor_projects } = await res.json()
-
-// 渲染环比
-const trend = monitor_projects.change_rate !== null
-  ? `${monitor_projects.change_rate > 0 ? '+' : ''}${monitor_projects.change_rate}%`
-  : '—'
+const res = await fetch('/platform/dashboard/compliance-trend')
+const { months } = await res.json()
+const xData      = months.map(m => m.month)
+const totalSeries = months.map(m => m.total_scans)
+const riskSeries  = months.map(m => m.risk_count)
+const rateSeries  = months.map(m => m.risk_rate ?? 0)
 ```
 
 ---
 
-## 平台任务管理
+## 多条件查询（`GET /platform/tasks/query`）
 
-> 所有接口数据来自平台本地 MySQL，与 compliance-sentry 无关，无需鉴权。
-
----
-
-### 多条件查询（`GET /platform/tasks/query`）
-
-支持多个可选条件组合过滤，支持分页，按创建时间倒序排列。
+多条件组合过滤平台任务，支持分页，按创建时间倒序排列。
 
 **Query 参数（均可选）：**
 
@@ -86,7 +293,7 @@ const trend = monitor_projects.change_rate !== null
 |------|------|------|
 | `task_id` | string | 按 `task_id` 精确匹配 |
 | `task_name` | string | 任务名称模糊匹配（包含即命中） |
-| `task_status` | string | 整体状态过滤：`active` / `completed` / `failed` / `deleted` |
+| `task_status` | string | 整体状态：`active` / `completed` / `failed` / `deleted` |
 | `ingest_id` | integer | 按关联 `ingest_id` 查询 |
 | `s1_status` | string | S1 服务状态：`pending` / `running` / `success` / `failed` / `skipped` |
 | `s2_status` | string | S2 服务状态（同上） |
@@ -99,7 +306,7 @@ const trend = monitor_projects.change_rate !== null
 | `page` | integer | 页码，从 1 开始，默认 1 |
 | `page_size` | integer | 每页条数，默认 20，最大 200 |
 
-**响应（200）：**
+### 响应（200）
 
 ```json
 {
@@ -109,7 +316,7 @@ const trend = monitor_projects.change_rate !== null
   "items": [
     {
       "id": 1,
-      "task_id": "pt-a1b2c3d4e5f6...",
+      "task_id": "pt-a1b2c3d4...",
       "task_name": "my-project",
       "ingest_id": 42,
       "task_status": "completed",
@@ -118,6 +325,7 @@ const trend = monitor_projects.change_rate !== null
       "s3_status": "success",
       "s4_status": "skipped",
       "s5_status": "skipped",
+      "s3_analysis_id": "uuid-xxxx",
       "created_at": "2026-05-01T10:00:00Z",
       "updated_at": "2026-05-01T10:30:00Z",
       "deleted_at": null
@@ -126,22 +334,9 @@ const trend = monitor_projects.change_rate !== null
 }
 ```
 
-**前端调用示例：**
-
-```javascript
-// 查询正在运行中的 S1 扫描任务，第 1 页
-const params = new URLSearchParams({
-  s1_status: 'running',
-  page: 1,
-  page_size: 20
-})
-const res = await fetch(`/platform/tasks/query?${params}`)
-const { total, items } = await res.json()
-```
-
 ---
 
-### 查询单条任务（`GET /platform/tasks/{task_id}`）
+## 查询单条任务（`GET /platform/tasks/{task_id}`）
 
 按 `task_id` 精确查询单条平台任务详情。
 
@@ -151,30 +346,35 @@ const { total, items } = await res.json()
 |------|------|
 | `task_id` | 平台任务唯一标识，格式 `pt-<uuid4hex>` |
 
-**响应（200）：**
+### 响应（200）
 
 ```json
 {
   "id": 1,
-  "task_id": "pt-a1b2c3d4e5f6...",
+  "task_id": "pt-a1b2c3d4...",
   "task_name": "my-project",
   "ingest_id": 42,
   "task_status": "active",
-  "s1_status": "running",
+  "s1_status": "success",
   "s2_status": "skipped",
-  "s3_status": "pending",
+  "s3_status": "running",
   "s4_status": "skipped",
   "s5_status": "skipped",
+  "s3_analysis_id": "uuid-xxxx",
   "created_at": "2026-05-01T10:00:00Z",
   "updated_at": "2026-05-01T10:05:00Z",
   "deleted_at": null
 }
 ```
 
-**任务整体状态（`task_status`）说明：**
+| 字段 | 说明 |
+|------|------|
+| `s3_analysis_id` | compliance-sentry 分析任务 ID，sentry 接受任务后写入，可用于直接查询 sentry 进度或调用 `sync-status` |
 
-| 值 | 触发条件 |
-|----|---------|
+**任务整体状态（`task_status`）推导规则：**
+
+| 值 | 条件 |
+|----|------|
 | `active` | 有服务仍处于 `pending` 或 `running` |
 | `completed` | 所有选中服务均为 `success` |
 | `failed` | 至少一个选中服务为 `failed` |
@@ -186,9 +386,9 @@ const { total, items } = await res.json()
 
 ---
 
-### 服务状态回调（`PATCH /platform/tasks/{task_id}/service-status`）
+## 服务状态回调（`PATCH /platform/tasks/{task_id}/service-status`）
 
-> 供平台内部各扫描服务（S1~S5）在完成/失败时回调，更新自身状态并自动推导整体状态。前端通常无需调用此接口。
+供平台内部扫描服务（S1~S5）在完成/失败时回调，更新自身状态并自动推导整体状态。
 
 **路径参数：**
 
@@ -204,7 +404,7 @@ const { total, items } = await res.json()
 {
   "service": "S1",
   "status": "success",
-  "message": "可选的附加说明（如失败原因）"
+  "message": "可选附加说明"
 }
 ```
 
@@ -214,11 +414,11 @@ const { total, items } = await res.json()
 | `status` | string | 是 | `running` / `success` / `failed` / `skipped` |
 | `message` | string | 否 | 附加说明，最多 500 字符 |
 
-**响应（200）：**
+### 响应（200）
 
 ```json
 {
-  "task_id": "pt-a1b2c3d4e5f6...",
+  "task_id": "pt-a1b2c3d4...",
   "service": "S1",
   "service_status": "success",
   "task_status": "completed",
@@ -233,15 +433,102 @@ const { total, items } = await res.json()
 
 ---
 
-## OAT 规则配置管理
+## 实时同步 S3 状态（`POST /platform/tasks/{task_id}/s3/sync-status`）
 
-> OAT（Open source Audit Tool）是平台内置的开源合规扫描工具（S1 服务）。  
-> 前端通过此组接口管理规则配置，在提交 `POST /platform/tasks` 时通过 `s1_rule_config_id` 指定使用哪套规则。  
-> 不指定则使用 oat_python 内置默认规则（`OAT-Default.xml`）。
+主动从 compliance-sentry 查询最新扫描状态，并同步写入平台任务表。
+
+**适用场景**：Celery worker 未启动或轮询任务失败，导致 `s3_status` 长期停留在 `running`；或前端需要立即刷新状态。
+
+**路径参数：**
+
+| 参数 | 说明 |
+|------|------|
+| `task_id` | 平台任务唯一标识 |
+
+**行为逻辑：**
+
+1. 读取 `platform_task.s3_analysis_id`；
+2. 若 `s3_status` 已为终态（`success`/`failed`/`skipped`），直接返回当前值（`synced: false`）；
+3. 调用 sentry `GET /analysis/{id}/status`，映射状态；
+4. 若 sentry 已 `completed`，额外调用 `GET /analysis/{id}/conflicts` 获取冲突数，一并写入 `s3_has_conflicts`、`s3_conflict_count`；
+5. 返回同步结果。
+
+**sentry 状态映射：**
+
+| sentry `current_status` | 写入 `s3_status` |
+|------------------------|----------------|
+| `completed` | `success` |
+| `failed` | `failed` |
+| `terminated` | `failed` |
+| `pending` / `running` | 不变（保持 `running`） |
+
+### 响应（200）— 已同步
+
+```json
+{
+  "task_id": "pt-a1b2c3d4...",
+  "s3_analysis_id": "uuid-xxxx",
+  "sentry_status": "completed",
+  "sentry_progress": 100,
+  "s3_status": "success",
+  "s3_has_conflicts": true,
+  "s3_conflict_count": 3,
+  "task_status": "completed",
+  "synced": true,
+  "updated_at": "2026-05-13T09:00:00Z"
+}
+```
+
+### 响应（200）— 已是终态，无需同步
+
+```json
+{
+  "task_id": "pt-a1b2c3d4...",
+  "s3_status": "success",
+  "task_status": "completed",
+  "s3_analysis_id": "uuid-xxxx",
+  "synced": false,
+  "reason": "s3_status already in terminal state: success"
+}
+```
+
+### 响应（200）— `s3_analysis_id` 尚未写入
+
+```json
+{
+  "task_id": "pt-a1b2c3d4...",
+  "s3_status": "pending",
+  "task_status": "active",
+  "s3_analysis_id": null,
+  "synced": false,
+  "reason": "s3_analysis_id not set yet (sentry job may not have been accepted)"
+}
+```
+
+**错误响应：**
+
+- `404`：task_id 不存在
+- `503`：sentry 认证失败或 `COMPLIANCE_SENTRY_BASE_URL` 未配置
+- `502`：连接 sentry 失败或 sentry 返回错误
+
+**前端轮询示例：**
+
+```javascript
+const pollS3 = async (taskId) => {
+  const res = await fetch(`/platform/tasks/${taskId}/s3/sync-status`, { method: 'POST' })
+  const data = await res.json()
+  const done = ['success', 'failed', 'skipped'].includes(data.s3_status)
+  return { done, data }
+}
+const timer = setInterval(async () => {
+  const { done, data } = await pollS3(platformTaskId)
+  if (done) { clearInterval(timer); console.log('S3 完成', data) }
+}, 10000)
+```
 
 ---
 
-### 列出规则配置（`GET /platform/oat-rules`）
+## 列出规则配置（`GET /platform/oat-rules`）
 
 **Query 参数：**
 
@@ -249,16 +536,16 @@ const { total, items } = await res.json()
 |------|------|------|
 | `is_active` | boolean | 按启用状态过滤；不传则返回全部 |
 
-**响应（200）：**
+### 响应（200）
 
 ```json
 {
-  "total": 3,
+  "total": 2,
   "items": [
     {
       "id": 1,
       "name": "华为默认规则",
-      "description": "适用于 CANN 系列仓库的合规规则",
+      "description": "适用于 CANN 系列仓库",
       "xml_content": "<?xml version=\"1.0\"...>",
       "is_active": true,
       "created_at": "2026-04-01T08:00:00Z",
@@ -268,11 +555,11 @@ const { total, items } = await res.json()
 }
 ```
 
-> `xml_content` 为 `null` 时表示该配置不叠加任何自定义规则，直接使用 oat_python 内置默认规则。
+> `xml_content` 为 `null` 时表示该配置不叠加自定义规则，直接使用 oat_python 内置默认规则。
 
 ---
 
-### 创建规则配置（`POST /platform/oat-rules`）
+## 创建规则配置（`POST /platform/oat-rules`）
 
 **Content-Type**：`application/json`
 
@@ -291,40 +578,10 @@ const { total, items } = await res.json()
 |------|------|------|------|
 | `name` | string | 是 | 规则配置名称，全局唯一，最多 255 字符 |
 | `description` | string | 否 | 描述，最多 500 字符 |
-| `xml_content` | string | 否 | OAT XML 规则内容（完整 XML 字符串）；**留空/null 表示使用内置默认规则** |
+| `xml_content` | string | 否 | OAT XML 规则内容；**留空/null 表示使用内置默认规则** |
 | `is_active` | boolean | 否 | 是否启用，默认 `true` |
 
-**XML 规则格式参考：**
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<configuration>
-  <oatconfig>
-    <policylist>
-      <policy name="projectPolicy" desc="自定义策略">
-        <!-- 允许 Apache-2.0 许可证 -->
-        <policyitem type="license" name="Apache-2.0" path=".*"
-                    rule="may" group="defaultGroup"
-                    filefilter="defaultPolicyFilter" desc=""/>
-        <!-- 版权持有者 -->
-        <policyitem type="copyright" name="My Company Co., Ltd." path=".*"
-                    rule="may" group="defaultGroup"
-                    filefilter="copyrightPolicyFilter" desc=""/>
-      </policy>
-    </policylist>
-    <filefilterlist>
-      <!-- 扩展默认过滤器，排除不需要扫描的路径 -->
-      <filefilter name="defaultFilter" desc="">
-        <filteritem type="filepath" name="projectroot/vendor/.*" desc="第三方依赖目录"/>
-      </filefilter>
-    </filefilterlist>
-  </oatconfig>
-</configuration>
-```
-
-> XML 会与 oat_python 内置 `OAT-Default.xml` **叠加合并**（不替换），合并规则详见 [OAT 规则叠加说明](#oat-规则叠加说明)。
-
-**响应（201）：**
+### 响应（201）
 
 ```json
 {
@@ -344,17 +601,17 @@ const { total, items } = await res.json()
 
 ---
 
-### 查看内置默认 XML（`GET /platform/oat-rules/builtin-xml`）
+## 查看内置默认 XML（`GET /platform/oat-rules/builtin-xml`）
 
-查看 oat_python 随包携带的内置规则 XML，**只读**，供参考编写自定义规则。
+返回 oat_python 随包携带的内置规则 XML，**只读**，供参考编写自定义规则。
 
 **Query 参数：**
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
-| `variant` | string | `default`（默认，OAT-Default.xml）或 `common`（OAT-Common.xml，CANN 通用模板） |
+| `variant` | string | `default`（默认，OAT-Default.xml）或 `common`（OAT-Common.xml） |
 
-**响应（200）：**
+### 响应（200）
 
 ```json
 {
@@ -363,9 +620,13 @@ const { total, items } = await res.json()
 }
 ```
 
+**错误响应：**
+
+- `404`：内置 XML 文件不存在（工具未正确安装）
+
 ---
 
-### 获取单条规则（`GET /platform/oat-rules/{rule_id}`）
+## 获取单条规则（`GET /platform/oat-rules/{rule_id}`）
 
 **路径参数：**
 
@@ -373,7 +634,9 @@ const { total, items } = await res.json()
 |------|------|
 | `rule_id` | 规则配置 ID（整数） |
 
-**响应（200）：** 同创建响应结构。
+### 响应（200）
+
+同创建规则配置的响应结构。
 
 **错误响应：**
 
@@ -381,9 +644,9 @@ const { total, items } = await res.json()
 
 ---
 
-### 更新规则配置（`PUT /platform/oat-rules/{rule_id}`）
+## 更新规则配置（`PUT /platform/oat-rules/{rule_id}`）
 
-所有字段均为可选，仅传入需要修改的字段。
+所有字段均可选，仅传入需要修改的字段。
 
 **路径参数：**
 
@@ -404,7 +667,9 @@ const { total, items } = await res.json()
 }
 ```
 
-**响应（200）：** 同创建响应结构，返回更新后的完整配置。
+### 响应（200）
+
+同创建规则配置的响应结构，返回更新后的完整配置。
 
 **错误响应：**
 
@@ -413,9 +678,9 @@ const { total, items } = await res.json()
 
 ---
 
-### 删除规则配置（`DELETE /platform/oat-rules/{rule_id}`）
+## 删除规则配置（`DELETE /platform/oat-rules/{rule_id}`）
 
-物理删除规则配置（不可恢复）。已通过该规则扫描的历史记录 `oat_scan_result.rule_config_id` 保留原值，不受影响。
+物理删除（不可恢复）。已关联该规则的历史扫描记录 `rule_config_id` 字段保留原值。
 
 **路径参数：**
 
@@ -423,7 +688,9 @@ const { total, items } = await res.json()
 |------|------|
 | `rule_id` | 规则配置 ID（整数） |
 
-**响应（204）：** 无响应体。
+### 响应（204）
+
+无响应体。
 
 **错误响应：**
 
@@ -431,11 +698,7 @@ const { total, items } = await res.json()
 
 ---
 
-## OAT 扫描结果
-
----
-
-### 查询扫描结果（`GET /platform/oat-scan-results/{task_id}`）
+## 查询扫描结果（`GET /platform/oat-scan-results/{task_id}`）
 
 按 `platform_task_id` 查询最新一条 OAT（S1）扫描结果。
 
@@ -445,12 +708,12 @@ const { total, items } = await res.json()
 |------|------|
 | `task_id` | 平台任务唯一标识（`pt-xxxx` 格式） |
 
-**响应（200）：**
+### 响应（200）
 
 ```json
 {
   "id": 10,
-  "platform_task_id": "pt-a1b2c3d4e5f6...",
+  "platform_task_id": "pt-a1b2c3d4...",
   "rule_config_id": 2,
   "celery_task_id": "celery-uuid-xxxx",
   "status": "success",
@@ -466,14 +729,14 @@ const { total, items } = await res.json()
 }
 ```
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `status` | string | `running` / `success` / `failed` / `cancelled` |
-| `exit_code` | integer \| null | oat_python 进程退出码：`0`=无问题，`1`=有 issue，`-1`=超时，`null`=尚未完成 |
-| `total_issues` | integer | 三类 issue 之和（`0` 表示完全合规） |
-| `report_text` | string \| null | `PlainReport_*.txt` 内容（截断至 64 KB），含各类问题明细 |
-| `rule_config_id` | integer \| null | 使用的规则配置 ID，`null` 表示使用内置默认规则 |
-| `celery_task_id` | string \| null | 异步模式下对应的 Celery task ID |
+| 字段 | 说明 |
+|------|------|
+| `status` | `running` / `success` / `failed` / `cancelled` |
+| `exit_code` | oat_python 退出码：`0`=无问题，`1`=有 issue，`-1`=超时，`null`=未完成 |
+| `total_issues` | 三类 issue 之和（`0` 表示完全合规） |
+| `report_text` | `PlainReport_*.txt` 内容（最长 64 KB），含问题明细 |
+| `rule_config_id` | 使用的规则配置 ID，`null` 表示内置默认规则 |
+| `celery_task_id` | 异步模式下的 Celery task ID |
 
 **错误响应：**
 
@@ -482,35 +745,24 @@ const { total, items } = await res.json()
 **前端轮询示例（异步模式）：**
 
 ```javascript
-const pollS1 = async (platformTaskId) => {
-  const task = await fetch(`/platform/tasks/${platformTaskId}`).then(r => r.json())
+const pollOAT = async (taskId) => {
+  const task = await fetch(`/platform/tasks/${taskId}`).then(r => r.json())
   if (['success', 'failed'].includes(task.s1_status)) {
-    // 扫描结束，获取详情
-    const result = await fetch(`/platform/oat-scan-results/${platformTaskId}`).then(r => r.json())
-    return result
+    return await fetch(`/platform/oat-scan-results/${taskId}`).then(r => r.json())
   }
-  return null // 仍在 running/pending，继续等待
+  return null
 }
-
-// 每 5 秒轮询一次
 const timer = setInterval(async () => {
-  const result = await pollS1(platformTaskId)
-  if (result) {
-    clearInterval(timer)
-    console.log('OAT 扫描完成', result)
-  }
+  const result = await pollOAT(platformTaskId)
+  if (result) { clearInterval(timer); console.log('OAT 扫描完成', result) }
 }, 5000)
 ```
 
 ---
 
-### 取消 S1 扫描（`DELETE /platform/tasks/{task_id}/s1`）
+## 取消 S1 扫描（`DELETE /platform/tasks/{task_id}/s1`）
 
 取消正在进行或等待中的 S1（OAT）扫描。
-
-- 若为异步模式（Celery），向 worker 发送 `SIGTERM` 终止进程；
-- 将 `platform_task.s1_status` 标记为 `failed`；
-- 将 `oat_scan_result.status` 标记为 `cancelled`。
 
 **路径参数：**
 
@@ -518,12 +770,19 @@ const timer = setInterval(async () => {
 |------|------|
 | `task_id` | 平台任务唯一标识 |
 
-**响应（200）：**
+**行为：**
+
+1. 查找该任务最新一条 `status='running'` 的 `oat_scan_result` 记录；
+2. 若存在 `celery_task_id`，向 Celery worker 发送 `SIGTERM` 终止进程；
+3. 将 `oat_scan_result.status` 更新为 `cancelled`；
+4. 将 `platform_task.s1_status` 更新为 `failed`，重新推导 `task_status`。
+
+### 响应（200）
 
 ```json
 {
   "status": "cancelled",
-  "task_id": "pt-a1b2c3d4e5f6...",
+  "task_id": "pt-a1b2c3d4...",
   "s1_status": "failed",
   "celery_task_id": "celery-uuid-xxxx",
   "celery_revoked": true
@@ -532,50 +791,39 @@ const timer = setInterval(async () => {
 
 | 字段 | 说明 |
 |------|------|
-| `celery_task_id` | Celery 任务 ID（若为同步扫描则为 `null`） |
-| `celery_revoked` | `true`=已成功向 Celery worker 发送终止信号；`false`=发送失败（进程可能已结束） |
+| `celery_task_id` | Celery 任务 ID；同步扫描时为 `null` |
+| `celery_revoked` | `true`=已成功发送终止信号；`false`=发送失败（进程可能已结束） |
 
 **错误响应：**
 
 - `404`：platform_task 不存在
-- `409`：S1 扫描已处于终态（`success` 或 `failed`），无需取消
-
----
-
-## OAT 规则叠加说明
-
-oat_python 按如下优先级（低→高）合并所有规则来源：
-
-```
-内置 OAT-Default.xml（oat_python 随包自带，始终加载）
-          ↓  通过 -oatconfig 叠加（+）
-自定义规则 XML（oat_rule_config.xml_content，写入临时文件）
-```
-
-**各节点合并语义（由 oat_python `loader.py` 定义，本平台不修改）：**
-
-| XML 节点 | 合并方式 |
-|----------|---------|
-| `filefilter` | **追加**：自定义过滤项附加到同名过滤器尾部 |
-| `policy.copyright` | **替换**：自定义版权规则替换默认版权规则 |
-| `policy.filetype` | **替换**：自定义文件类型规则替换默认规则 |
-| `policy.license` | **前置追加**：自定义许可证规则插入到默认规则前（OR 语义，两者同时生效） |
-| `licensematcher` | **追加**：自定义许可证全文匹配文本追加到全局列表 |
-| `licensecompatibilitylist` | **追加**：自定义兼容性条目追加到全局兼容性表 |
-
-> 若要**完全覆盖**某类默认规则，需在 XML 中使用 `<policy type="filetype" ...>` 等替换型节点（`copyright` / `filetype`）。`license` 类型始终是叠加（OR），无法通过配置完全覆盖默认许可证规则。
+- `409`：S1 扫描已处于终态（`success`/`failed`），不可取消
 
 ---
 
 ## 数据模型参考
 
-### `platform_task` 服务状态值
+### `platform_task` 表关键字段
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `task_id` | string | 唯一标识，格式 `pt-<uuid4hex>` |
+| `task_name` | string | 用户提交的任务名称 |
+| `ingest_id` | int | 关联 `file_ingest_result.id` |
+| `task_status` | string | `active` / `completed` / `failed` / `deleted` |
+| `s1_status` | string | S1 OAT 扫描状态 |
+| `s3_status` | string | S3 compliance-sentry 扫描状态 |
+| `s3_analysis_id` | string \| null | sentry 分析任务 ID |
+| `s3_has_conflicts` | bool \| null | sentry 是否检测到冲突，扫描完成后写入 |
+| `s3_conflict_count` | int | sentry 冲突数量，扫描完成后写入 |
+
+### 服务状态值（`s1_status` / `s3_status` 等）
 
 | 值 | 说明 |
 |----|------|
 | `pending` | 已创建，等待扫描开始 |
 | `running` | 扫描正在进行中 |
-| `success` | 扫描完成，无报错 |
+| `success` | 扫描完成（可能有 issue，见各服务结果表） |
 | `failed` | 扫描失败或被取消 |
 | `skipped` | 当前任务未选用该服务 |
 
@@ -587,3 +835,22 @@ oat_python 按如下优先级（低→高）合并所有规则来源：
 | `success` | 扫描完成（可能有 issue，见 `total_issues`） |
 | `failed` | 执行异常或超时 |
 | `cancelled` | 被 `DELETE /platform/tasks/{id}/s1` 主动取消 |
+
+### OAT 规则叠加说明
+
+oat_python 按如下优先级（低→高）合并规则：
+
+```
+内置 OAT-Default.xml（始终加载）
+          ↓  通过 -oatconfig 叠加
+自定义规则 XML（oat_rule_config.xml_content）
+```
+
+| XML 节点 | 合并方式 |
+|---------|---------|
+| `filefilter` | 追加到同名过滤器 |
+| `policy.copyright` | 替换默认版权规则 |
+| `policy.filetype` | 替换默认文件类型规则 |
+| `policy.license` | 前置追加（OR 语义，两者同时生效） |
+| `licensematcher` | 追加到全局列表 |
+| `licensecompatibilitylist` | 追加到全局兼容性表 |
