@@ -32,7 +32,7 @@ class PlatformTaskResponse(BaseModel):
     id: int
     task_id: str
     task_name: str
-    ingest_id: Optional[int]
+    ingest_id: Optional[str]
     task_status: TaskStatus
     s1_status: ServiceStatus
     s2_status: ServiceStatus

@@ -141,7 +141,7 @@ async def query_platform_tasks(
     task_status: Optional[str] = Query(
         None, description="任务整体状态过滤：active / completed / failed / deleted"
     ),
-    ingest_id: Optional[int] = Query(None, description="按关联 ingest_id 查询"),
+    ingest_id: Optional[str] = Query(None, description="按关联 ingest_id 查询"),
     s1_status: Optional[str] = Query(None, description="S1 服务状态过滤"),
     s2_status: Optional[str] = Query(None, description="S2 服务状态过滤"),
     s3_status: Optional[str] = Query(None, description="S3 服务状态过滤"),

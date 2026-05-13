@@ -33,7 +33,7 @@ class PlatformTask(Base):
     每次调用 POST /platform/tasks 时创建一条记录，记录：
     - task_id     : 自动生成的唯一任务标识（pt-<uuid4>）
     - task_name   : 用户提交的任务名称
-    - ingest_id   : 关联的文件入库记录 ID（FileIngestResult.id）
+    - ingest_id   : 关联的文件入库记录 ID（字符串形式的 FileIngestResult.id）
     - task_status : 任务整体状态
                     active    — 正常运行中（默认）
                     completed — 所有选中服务均已完成
@@ -61,8 +61,8 @@ class PlatformTask(Base):
     task_name: Mapped[str] = mapped_column(
         String(255), nullable=False, comment="用户提交的任务名称"
     )
-    ingest_id: Mapped[Optional[int]] = mapped_column(
-        Integer, nullable=True, index=True, comment="关联 file_ingest_result.id"
+    ingest_id: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True, index=True, comment="关联 file_ingest_result.id（字符串）"
     )
     # sentry 侧分析任务 ID（mission/upload 或 mission/git 返回的 analysis_id）
     s3_analysis_id: Mapped[Optional[str]] = mapped_column(

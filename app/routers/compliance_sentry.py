@@ -775,10 +775,10 @@ async def platform_tasks(
     )
     db.add(row)
     await db.flush()
-    ingest_id = row.id
-    
+    ingest_id = str(row.id)
+
     logger.info(
-        "platform_tasks — ingest complete — ingest_id=%d task_name=%s source_type=%s source_label=%s s3_status=%s",
+        "platform_tasks — ingest complete — ingest_id=%s task_name=%s source_type=%s source_label=%s s3_status=%s",
         ingest_id, task_name, source_type, source_label[:50] if source_label else "N/A", s3_status
     )
 
@@ -796,7 +796,7 @@ async def platform_tasks(
     await db.flush()
     platform_task_id = pt.task_id
     logger.info(
-        "platform_tasks — task record created — platform_task_id=%s ingest_id=%d task_name=%s services=%s",
+        "platform_tasks — task record created — platform_task_id=%s ingest_id=%s task_name=%s services=%s",
         platform_task_id, ingest_id, task_name, services_norm,
     )
 
@@ -830,21 +830,21 @@ async def platform_tasks(
 
     if not want_s3:
         logger.info(
-            "platform_tasks complete (no compliance-sentry) — ingest_id=%d task_name=%s services=%s",
-            ingest_id, task_name, services_norm,
+        "platform_tasks complete (no compliance-sentry) — ingest_id=%s task_name=%s services=%s",
+        ingest_id, task_name, services_norm,
         )
         return out
 
     if not settings.compliance_sentry_base_url:
         raise HTTPException(status_code=503, detail="COMPLIANCE_SENTRY_BASE_URL not configured")
     
-    logger.info("platform_tasks — submitting to sentry — ingest_id=%d task_name=%s async=%s", ingest_id, task_name, async_scan)
+    logger.info("platform_tasks — submitting to sentry — ingest_id=%s task_name=%s async=%s", ingest_id, task_name, async_scan)
 
     # 自动获取 sentry token，前端无需传 Authorization
     try:
         token = await get_token()
     except RuntimeError as e:
-        logger.error("platform_tasks — sentry auth failed — ingest_id=%d error=%s", ingest_id, e)
+        logger.error("platform_tasks — sentry auth failed — ingest_id=%s error=%s", ingest_id, e)
         raise HTTPException(status_code=503, detail=f"sentry auth failed: {e}")
     sentry_headers = {"Authorization": f"Bearer {token}"}
 
@@ -883,7 +883,7 @@ async def platform_tasks(
             out["sentry_async"] = True
             out["platform_task_id"] = ar.id
             logger.info(
-                "platform_tasks — submitted to sentry async (git) — ingest_id=%d task_name=%s celery_task_id=%s git_url=%s",
+                "platform_tasks — submitted to sentry async (git) — ingest_id=%s task_name=%s celery_task_id=%s git_url=%s",
                 ingest_id, task_name, ar.id, source_url.strip()
             )
             # running 状态和轮询由 sentry_mission_task 内部在获得 analysis_id 后写库
@@ -921,14 +921,14 @@ async def platform_tasks(
             out["status"] = "error"
             out["error"] = sentry_body
             logger.error(
-                "platform_tasks — sentry sync failed (git) — ingest_id=%d task_name=%s status=%d body=%s",
+                "platform_tasks — sentry sync failed (git) — ingest_id=%s task_name=%s status=%d body=%s",
                 ingest_id, task_name, r.status_code, str(sentry_body)[:300]
             )
             await _update_platform_task_s3(db, platform_task_id, "failed")
         else:
             analysis_id = sentry_body.get("analysis_id")
             logger.info(
-                "platform_tasks — sentry sync accepted (git) — ingest_id=%d task_name=%s analysis_id=%s",
+                "platform_tasks — sentry sync accepted (git) — ingest_id=%s task_name=%s analysis_id=%s",
                 ingest_id, task_name, analysis_id or "N/A"
             )
             # sentry 返回 202 表示已接受，扫描在 sentry 后台异步进行 → running
@@ -988,7 +988,7 @@ async def platform_tasks(
         out["sentry_async"] = True
         out["platform_task_id"] = ar.id
         logger.info(
-            "platform_tasks — submitted to sentry async (upload) — ingest_id=%d task_name=%s celery_task_id=%s file=%s",
+            "platform_tasks — submitted to sentry async (upload) — ingest_id=%s task_name=%s celery_task_id=%s file=%s",
             ingest_id, task_name, ar.id, upload_filename
         )
         # running 状态和轮询由 sentry_mission_task 内部在获得 analysis_id 后写库
@@ -1019,14 +1019,14 @@ async def platform_tasks(
         out["status"] = "error"
         out["error"] = sentry_body
         logger.error(
-            "platform_tasks — sentry sync failed (upload) — ingest_id=%d task_name=%s status=%d body=%s",
+            "platform_tasks — sentry sync failed (upload) — ingest_id=%s task_name=%s status=%d body=%s",
             ingest_id, task_name, r.status_code, str(sentry_body)[:300]
         )
         await _update_platform_task_s3(db, platform_task_id, "failed")
     else:
         analysis_id = sentry_body.get("analysis_id")
         logger.info(
-            "platform_tasks — sentry sync accepted (upload) — ingest_id=%d task_name=%s analysis_id=%s",
+            "platform_tasks — sentry sync accepted (upload) — ingest_id=%s task_name=%s analysis_id=%s",
             ingest_id, task_name, analysis_id or "N/A"
         )
         # sentry 返回 202 表示已接受，扫描在 sentry 后台异步进行 → running

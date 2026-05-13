@@ -176,7 +176,7 @@ async def files_ingest(
     )
     db.add(row)
     await db.flush()
-    ingest_id = row.id
+    ingest_id = str(row.id)
     logger.info("files_ingest done: ingest_id=%s source_type=%s s3_status=%s", ingest_id, source_type, s3_status)
     return {"status": "success", "ingest_id": ingest_id, "meta": meta, "tree": tree}
 
