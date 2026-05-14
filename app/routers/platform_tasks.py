@@ -27,6 +27,8 @@ from app.schemas.platform_task import (
     ComplianceTrendResponse,
     DashboardResponse,
     MonitorProjectStats,
+    OatRiskPieResponse,
+    OatRiskTypeItem,
     PendingRisksResponse,
     PlatformTaskListResponse,
     PlatformTaskResponse,
@@ -61,7 +63,7 @@ async def platform_dashboard(
     - **monitor_projects.current**     : 本月（自然月）新增监控项目数
     - **monitor_projects.last_month**  : 上月新增监控项目数
     - **monitor_projects.change**      : 环比变化量（本月 - 上月）
-    - **monitor_projects.change_rate** : 环比变化率（%），上月为 0 时返回 null
+    - **monitor_projects.change_rate** : 环比变化率（%），上月为 0 时返回 0.0
 
     统计口径：`platform_task` 表中 `task_status != 'deleted'` 的记录，
     按 `created_at` 所在自然月分组计数。
@@ -103,8 +105,8 @@ async def platform_dashboard(
     last_month_count: int = last_month_count_result.scalar_one()
 
     change = current_count - last_month_count
-    change_rate: Optional[float] = (
-        round(change / last_month_count * 100, 2) if last_month_count != 0 else None
+    change_rate: float = (
+        round(change / last_month_count * 100, 2) if last_month_count != 0 else 0.0
     )
 
     month_str = now.strftime("%Y-%m")
@@ -493,7 +495,7 @@ def _month_boundaries(now: datetime) -> tuple[datetime, datetime, datetime]:
 
 def _make_stats(current: int, last_month: int) -> ServiceRiskStats:
     change = current - last_month
-    change_rate = round(change / last_month * 100, 2) if last_month != 0 else None
+    change_rate = round(change / last_month * 100, 2) if last_month != 0 else 0.0
     return ServiceRiskStats(
         current=current, last_month=last_month,
         change=change, change_rate=change_rate,
@@ -501,7 +503,7 @@ def _make_stats(current: int, last_month: int) -> ServiceRiskStats:
     )
 
 
-_PLACEHOLDER = ServiceRiskStats(current=0, last_month=0, change=0, change_rate=None, integrated=False)
+_PLACEHOLDER = ServiceRiskStats(current=0, last_month=0, change=0, change_rate=0.0, integrated=False)
 
 
 # ===========================================================================
@@ -767,3 +769,105 @@ async def dashboard_compliance_trend(
         [(m.month, m.total_scans, m.risk_count) for m in result_months],
     )
     return ComplianceTrendResponse(months=result_months)
+
+
+# ===========================================================================
+# GET /platform/dashboard/s1/risk-distribution  — OAT 风险类型分布（饼图）
+# ===========================================================================
+
+@router.get(
+    "/platform/dashboard/s1/risk-distribution",
+    response_model=OatRiskPieResponse,
+    summary="OAT(S1) 风险类型分布看板（饼图）",
+    tags=["platform-dashboard"],
+)
+async def dashboard_s1_risk_distribution(
+    month: Optional[str] = Query(
+        None,
+        description=(
+            "按月筛选，格式 YYYY-MM（如 2026-05）。"
+            "不传则统计全量成功扫描数据。"
+        ),
+        pattern=r"^\d{4}-\d{2}$",
+    ),
+    db: AsyncSession = Depends(get_db),
+) -> OatRiskPieResponse:
+    """
+    统计 OAT（S1）扫描结果中三类风险问题的数量分布，供前端饼图展示。
+
+    **风险类型说明：**
+    - `invalid_file_type`        — 二进制/归档文件类型不合规
+    - `license_header_invalid`   — License 头缺失或不合规
+    - `copyright_header_invalid` — Copyright 头缺失或不合规
+
+    **筛选规则：**
+    - 仅统计 `status = 'success'` 的扫描任务；
+    - 传入 `month`（YYYY-MM）则限定在该自然月内，否则统计全量数据。
+    """
+    # 构建基础条件：仅取成功扫描
+    conditions = [OatScanResult.status == "success"]
+
+    if month:
+        # 解析 YYYY-MM，计算月份首尾时间
+        try:
+            from calendar import monthrange
+            year, mon = int(month[:4]), int(month[5:7])
+            _, last_day = monthrange(year, mon)
+            from datetime import date
+            month_start = datetime(year, mon, 1, tzinfo=timezone.utc)
+            month_end = datetime(year, mon, last_day, 23, 59, 59, tzinfo=timezone.utc)
+        except (ValueError, IndexError):
+            raise HTTPException(status_code=400, detail="month 格式错误，应为 YYYY-MM")
+        conditions.append(OatScanResult.created_at >= month_start)
+        conditions.append(OatScanResult.created_at <= month_end)
+
+    stmt = select(
+        func.count(OatScanResult.id).label("scan_count"),
+        func.coalesce(func.sum(OatScanResult.invalid_file_type_count), 0).label("invalid_file_type"),
+        func.coalesce(func.sum(OatScanResult.license_header_invalid_count), 0).label("license_header_invalid"),
+        func.coalesce(func.sum(OatScanResult.copyright_header_invalid_count), 0).label("copyright_header_invalid"),
+    ).where(and_(*conditions))
+
+    row = (await db.execute(stmt)).one()
+
+    scan_count = int(row.scan_count)
+    cnt_file = int(row.invalid_file_type)
+    cnt_license = int(row.license_header_invalid)
+    cnt_copyright = int(row.copyright_header_invalid)
+    total = cnt_file + cnt_license + cnt_copyright
+
+    def _rate(count: int) -> float:
+        return round(count / total * 100, 2) if total > 0 else 0.0
+
+    items = [
+        OatRiskTypeItem(
+            type="invalid_file_type",
+            label="文件类型不合规",
+            count=cnt_file,
+            rate=_rate(cnt_file),
+        ),
+        OatRiskTypeItem(
+            type="license_header_invalid",
+            label="License 头缺失/不合规",
+            count=cnt_license,
+            rate=_rate(cnt_license),
+        ),
+        OatRiskTypeItem(
+            type="copyright_header_invalid",
+            label="Copyright 头缺失/不合规",
+            count=cnt_copyright,
+            rate=_rate(cnt_copyright),
+        ),
+    ]
+
+    logger.info(
+        "dashboard_s1_risk_distribution — month=%s scan_count=%d total=%d "
+        "file=%d license=%d copyright=%d",
+        month or "all", scan_count, total, cnt_file, cnt_license, cnt_copyright,
+    )
+    return OatRiskPieResponse(
+        total=total,
+        scan_count=scan_count,
+        month=month,
+        items=items,
+    )

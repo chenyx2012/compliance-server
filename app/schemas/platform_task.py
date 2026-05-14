@@ -101,8 +101,8 @@ class MonitorProjectStats(BaseModel):
     current: int = Field(..., description="本月总数")
     last_month: int = Field(..., description="上月总数")
     change: int = Field(..., description="环比变化量（本月 - 上月）")
-    change_rate: Optional[float] = Field(
-        None, description="环比变化率（百分比，上月为 0 时为 null）"
+    change_rate: float = Field(
+        0.0, description="环比变化率（百分比，上月为 0 时返回 0.0）"
     )
 
 
@@ -123,8 +123,8 @@ class ServiceRiskStats(BaseModel):
     current: int = Field(0, description="本月风险任务数")
     last_month: int = Field(0, description="上月风险任务数")
     change: int = Field(0, description="环比变化量（本月 - 上月）")
-    change_rate: Optional[float] = Field(
-        None, description="环比变化率（百分比，上月为 0 时为 null）"
+    change_rate: float = Field(
+        0.0, description="环比变化率（百分比，上月为 0 时返回 0.0）"
     )
     integrated: bool = Field(True, description="该服务是否已接入，false 表示预留占位")
 
@@ -184,3 +184,25 @@ class ComplianceTrendResponse(BaseModel):
     """最近 6 个月合规趋势看板响应。"""
 
     months: List[TrendMonthData] = Field(..., description="最近 6 个月数据，从最早到最近排列")
+
+
+# ---------------------------------------------------------------------------
+# OAT 风险类型分布（饼图）
+# ---------------------------------------------------------------------------
+
+class OatRiskTypeItem(BaseModel):
+    """单个 OAT 风险类型的统计项。"""
+
+    type: str = Field(..., description="风险类型标识：invalid_file_type / license_header_invalid / copyright_header_invalid")
+    label: str = Field(..., description="中文展示名称，供前端饼图直接使用")
+    count: int = Field(0, description="该风险类型在统计范围内的累计问题数")
+    rate: float = Field(0.0, description="占全部风险问题的百分比（保留两位小数）")
+
+
+class OatRiskPieResponse(BaseModel):
+    """OAT S1 风险类型分布看板响应（饼图数据）。"""
+
+    total: int = Field(0, description="三类风险问题总数")
+    scan_count: int = Field(0, description="纳入统计的成功扫描任务数")
+    month: Optional[str] = Field(None, description="若按月筛选则返回月份（YYYY-MM），否则为 null 表示全量统计")
+    items: List[OatRiskTypeItem] = Field(..., description="三个风险类型的明细列表")
