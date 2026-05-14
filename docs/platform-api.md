@@ -12,6 +12,7 @@
   - [总体风险数](#总体风险数get-platformdashboardrisk-overview)
   - [待处理扫描任务数](#待处理扫描任务数get-platformdashboardpending-risks)
   - [最近 6 个月合规趋势](#最近-6-个月合规趋势get-platformdashboardcompliance-trend)
+  - [OAT 风险类型分布（饼图）](#oat-风险类型分布饼图get-platformdashboards1risk-distribution)
 - **平台任务管理**
   - [多条件查询](#多条件查询get-platformtasksquery)
   - [查询单条任务](#查询单条任务get-platformtaskstask_id)
@@ -69,7 +70,7 @@
 {
   "status": "success",
   "platform_task_id": "pt-a1b2c3d4...",
-  "ingest_id": 42,
+  "ingest_id": "42",
   "meta": { "source": "upload", "type": "archive", "filename": "project.zip" },
   "tree": { "path": "project", "next": {}, "content": null },
   "services": ["S1", "S3"],
@@ -94,7 +95,7 @@
 {
   "status": "success",
   "platform_task_id": "pt-a1b2c3d4...",
-  "ingest_id": 42,
+  "ingest_id": "42",
   "services": ["S1", "S3"],
   "s1_async": true,
   "s1_celery_task_id": "celery-task-uuid",
@@ -131,7 +132,7 @@
 | `monitor_projects.current` | 本月新增监控项目数 |
 | `monitor_projects.last_month` | 上月监控项目数 |
 | `monitor_projects.change` | 环比变化量（正为增，负为减） |
-| `monitor_projects.change_rate` | 环比变化率（%），上月为 0 时返回 `null` |
+| `monitor_projects.change_rate` | 环比变化率（%），上月为 0 时返回 `0.0` |
 
 ---
 
@@ -161,10 +162,10 @@
   },
   "by_service": {
     "s1": { "current": 8, "last_month": 6, "change": 2,  "change_rate": 33.33, "integrated": true  },
-    "s2": { "current": 0, "last_month": 0, "change": 0,  "change_rate": null,  "integrated": false },
+    "s2": { "current": 0, "last_month": 0, "change": 0,  "change_rate": 0.0,   "integrated": false },
     "s3": { "current": 7, "last_month": 4, "change": 3,  "change_rate": 75.0,  "integrated": true  },
-    "s4": { "current": 0, "last_month": 0, "change": 0,  "change_rate": null,  "integrated": false },
-    "s5": { "current": 0, "last_month": 0, "change": 0,  "change_rate": null,  "integrated": false }
+    "s4": { "current": 0, "last_month": 0, "change": 0,  "change_rate": 0.0,   "integrated": false },
+    "s5": { "current": 0, "last_month": 0, "change": 0,  "change_rate": 0.0,   "integrated": false }
   }
 }
 ```
@@ -174,7 +175,7 @@
 | `current` | 本月风险任务数 |
 | `last_month` | 上月风险任务数 |
 | `change` | 环比变化量 |
-| `change_rate` | 环比变化率（%），上月为 0 时为 `null` |
+| `change_rate` | 环比变化率（%），上月为 0 时返回 `0.0` |
 | `integrated` | 服务是否已接入，`false` 表示预留占位 |
 
 > `s3_has_conflicts` 在 S3 扫描完成时由 `sentry_poll_task` 或 `POST /platform/tasks/{id}/s3/sync-status` 自动写入。
@@ -199,10 +200,10 @@
   },
   "by_service": {
     "s1": { "current": 3, "last_month": 2, "change": 1, "change_rate": 50.0,  "integrated": true  },
-    "s2": { "current": 0, "last_month": 0, "change": 0, "change_rate": null,  "integrated": false },
+    "s2": { "current": 0, "last_month": 0, "change": 0, "change_rate": 0.0,   "integrated": false },
     "s3": { "current": 2, "last_month": 1, "change": 1, "change_rate": 100.0, "integrated": true  },
-    "s4": { "current": 0, "last_month": 0, "change": 0, "change_rate": null,  "integrated": false },
-    "s5": { "current": 0, "last_month": 0, "change": 0, "change_rate": null,  "integrated": false }
+    "s4": { "current": 0, "last_month": 0, "change": 0, "change_rate": 0.0,   "integrated": false },
+    "s5": { "current": 0, "last_month": 0, "change": 0, "change_rate": 0.0,   "integrated": false }
   }
 }
 ```
@@ -283,6 +284,77 @@ const rateSeries  = months.map(m => m.risk_rate ?? 0)
 
 ---
 
+## OAT 风险类型分布（饼图）（`GET /platform/dashboard/s1/risk-distribution`）
+
+统计 OAT（S1）扫描结果中三类风险问题的数量与占比，供前端饼图展示。
+
+### 请求参数（Query，均可选）
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `month` | string | 按月筛选，格式 `YYYY-MM`（如 `2026-05`）。不传则统计全量历史数据。 |
+
+### 风险类型说明
+
+| `type` 值 | `label` | 说明 |
+|-----------|---------|------|
+| `invalid_file_type` | 文件类型不合规 | 归档/二进制文件被扫描到不符合规范 |
+| `license_header_invalid` | License 头缺失/不合规 | 源文件缺少合规 License 声明头 |
+| `copyright_header_invalid` | Copyright 头缺失/不合规 | 源文件缺少合规 Copyright 声明头 |
+
+**统计口径：** 仅纳入 `status = 'success'` 的 OAT 扫描任务；传入 `month` 则按该自然月的 `created_at` 过滤。
+
+### 响应（200）
+
+```json
+{
+  "total": 1520,
+  "scan_count": 38,
+  "month": "2026-05",
+  "items": [
+    {
+      "type": "invalid_file_type",
+      "label": "文件类型不合规",
+      "count": 210,
+      "rate": 13.82
+    },
+    {
+      "type": "license_header_invalid",
+      "label": "License 头缺失/不合规",
+      "count": 890,
+      "rate": 58.55
+    },
+    {
+      "type": "copyright_header_invalid",
+      "label": "Copyright 头缺失/不合规",
+      "count": 420,
+      "rate": 27.63
+    }
+  ]
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `total` | 三类风险问题总数（三项 `count` 之和，饼图分母） |
+| `scan_count` | 统计范围内成功完成的 OAT 扫描任务数 |
+| `month` | 若传入 `month` 参数则原样返回，否则为 `null`（表示全量统计） |
+| `items[].type` | 风险类型标识符（可作为前端 key） |
+| `items[].label` | 风险类型中文名（直接用于饼图图例） |
+| `items[].count` | 该风险类型的累计问题数 |
+| `items[].rate` | 占全部风险问题的百分比（保留两位小数，无数据时为 `0.0`） |
+
+**前端示例（ECharts 饼图）：**
+
+```javascript
+const res = await fetch('/platform/dashboard/s1/risk-distribution?month=2026-05')
+const { items, total, scan_count } = await res.json()
+const pieData = items.map(i => ({ name: i.label, value: i.count }))
+// option.series[0].data = pieData
+```
+
+---
+
 ## 多条件查询（`GET /platform/tasks/query`）
 
 多条件组合过滤平台任务，支持分页，按创建时间倒序排列。
@@ -294,7 +366,7 @@ const rateSeries  = months.map(m => m.risk_rate ?? 0)
 | `task_id` | string | 按 `task_id` 精确匹配 |
 | `task_name` | string | 任务名称模糊匹配（包含即命中） |
 | `task_status` | string | 整体状态：`active` / `completed` / `failed` / `deleted` |
-| `ingest_id` | integer | 按关联 `ingest_id` 查询 |
+| `ingest_id` | string | 按关联 `ingest_id` 查询 |
 | `s1_status` | string | S1 服务状态：`pending` / `running` / `success` / `failed` / `skipped` |
 | `s2_status` | string | S2 服务状态（同上） |
 | `s3_status` | string | S3 服务状态（同上） |
@@ -318,7 +390,7 @@ const rateSeries  = months.map(m => m.risk_rate ?? 0)
       "id": 1,
       "task_id": "pt-a1b2c3d4...",
       "task_name": "my-project",
-      "ingest_id": 42,
+      "ingest_id": "42",
       "task_status": "completed",
       "s1_status": "success",
       "s2_status": "skipped",
@@ -353,7 +425,7 @@ const rateSeries  = months.map(m => m.risk_rate ?? 0)
   "id": 1,
   "task_id": "pt-a1b2c3d4...",
   "task_name": "my-project",
-  "ingest_id": 42,
+  "ingest_id": "42",
   "task_status": "active",
   "s1_status": "success",
   "s2_status": "skipped",
