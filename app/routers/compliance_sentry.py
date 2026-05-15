@@ -245,6 +245,8 @@ async def sentry_analysis_delete(
 ):
     """
     删除 sentry 分析任务并透传响应。
+    sentry 侧删除为异步清理磁盘：成功时可能返回 **202 Accepted**（任务已从 DB 移除，
+    大目录在后台删除）；网关仍视为成功并照常更新平台任务状态。
     若提供 platform_task_id，删除成功后将主任务的 s3_status 更新为 failed，
     task_status 同步重新推导（表示该扫描服务已被中止/删除）。
     """
