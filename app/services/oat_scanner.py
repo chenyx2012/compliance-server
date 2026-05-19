@@ -40,8 +40,8 @@ logger = logging.getLogger(__name__)
 # oat_python 的 Python 包所在目录（tools/oat_python/src/oat/__init__.py）
 _OAT_SRC_DIR = Path(__file__).parent.parent / "tools" / "oat_python" / "src"
 
-# PlainReport_*.txt 截断阈值（64 KB）
-_REPORT_MAX_BYTES = 64 * 1024
+# report_text 不做 Python 层截断，完整保存 PlainReport_*.txt 内容；
+# 数据库列类型为 MEDIUMTEXT（MySQL 最大 16 MB）。
 
 
 # ===========================================================================
@@ -63,6 +63,65 @@ def _parse_report_stats(report_text: str) -> Dict[str, int]:
         "copyright_header_invalid_count": copyright_invalid,
         "total_issues": invalid_file_type + license_invalid + copyright_invalid,
     }
+
+
+# 每条 issue 行的格式（来自 plain_reporter.py）：
+# Name:\t<type>\tContent:\t<content>\tLine:\t<n>\tProject:\t<proj>\tFile:\t<path>
+_ISSUE_LINE_RE = re.compile(
+    r"^Name:\t(?P<name>[^\t]+)\t"
+    r"Content:\t(?P<content>[^\t]*)\t"
+    r"Line:\t\d+\t"
+    r"Project:\t(?P<project>[^\t]*)\t"
+    r"File:\t(?P<file>.+)$"
+)
+
+_ISSUE_TYPE_MAP = {
+    "Invalid File Type": "invalid_file_type",
+    "License Header Invalid": "license_header_invalid",
+    "Copyright Header Invalid": "copyright_header_invalid",
+}
+
+
+def _parse_report_issues(report_text: str) -> Dict[str, list]:
+    """
+    解析 PlainReport_*.txt，将三类 issue 转为结构化 JSON 列表。
+
+    返回：
+    {
+      "invalid_file_type":         [{"file": ..., "content": ..., "project": ...}, ...],
+      "license_header_invalid":    [...],
+      "copyright_header_invalid":  [...],
+    }
+
+    每条 issue 字段说明：
+    - file    : 问题文件路径（相对于仓库根）
+    - content : issue 具体内容
+                  Invalid File Type     → 文件类型（如 "unknown" / "binary"）
+                  License Header Invalid  → 许可证标识（如 "NoLicenseHeader" / "GPL-2.0-only"）
+                  Copyright Header Invalid → 版权声明内容（如 "NULL" / "Copyright 2024 Xxx"）
+    - project : oat 扫描时使用的项目名称
+    """
+    buckets: Dict[str, list] = {
+        "invalid_file_type": [],
+        "license_header_invalid": [],
+        "copyright_header_invalid": [],
+    }
+    for raw_line in report_text.splitlines():
+        line = raw_line.strip()
+        m = _ISSUE_LINE_RE.match(line)
+        if not m:
+            continue
+        bucket_key = _ISSUE_TYPE_MAP.get(m.group("name"))
+        if bucket_key is None:
+            continue
+        buckets[bucket_key].append(
+            {
+                "file": m.group("file"),
+                "content": m.group("content"),
+                "project": m.group("project"),
+            }
+        )
+    return buckets
 
 
 # ===========================================================================
@@ -158,14 +217,14 @@ async def run_oat_scan(
         report_file = report_dir / f"PlainReport_{project_name}.txt"
         report_text = ""
         if report_file.exists():
-            raw = report_file.read_bytes()
-            report_text = raw[:_REPORT_MAX_BYTES].decode("utf-8", errors="replace")
+            report_text = report_file.read_text(encoding="utf-8", errors="replace")
 
         stats = _parse_report_stats(report_text)
+        issues = _parse_report_issues(report_text)
 
         logger.info(
-            "run_oat_scan done — project=%s exit_code=%d total_issues=%d",
-            project_name, exit_code, stats["total_issues"],
+            "run_oat_scan done — project=%s exit_code=%d total_issues=%d report_bytes=%d",
+            project_name, exit_code, stats["total_issues"], len(report_text.encode("utf-8")),
         )
 
         return {
@@ -174,6 +233,7 @@ async def run_oat_scan(
             "stdout_tail": stdout_tail,
             "report_text": report_text,
             **stats,
+            **issues,
         }
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -278,6 +338,9 @@ def _finish_oat_scan_result_sync(
     扫描完成时，按 result_id 更新已有 oat_scan_result 记录为终态。
     若 result_id 为 None（首次插入失败），则降级为新建一条记录。
     Celery worker 用。
+
+    stats 中除计数字段外，还包含三类 issue JSON 列表：
+      invalid_file_type / license_header_invalid / copyright_header_invalid
     """
     from sqlalchemy import create_engine, select
     from sqlalchemy.orm import sessionmaker
@@ -305,13 +368,22 @@ def _finish_oat_scan_result_sync(
             row.invalid_file_type_count = stats.get("invalid_file_type_count", 0)
             row.license_header_invalid_count = stats.get("license_header_invalid_count", 0)
             row.copyright_header_invalid_count = stats.get("copyright_header_invalid_count", 0)
-            row.report_text = (report_text[:_REPORT_MAX_BYTES] if report_text else None)
+            # 三类问题结构化 JSON 列表
+            row.invalid_file_type_issues = stats.get("invalid_file_type") or []
+            row.license_header_invalid_issues = stats.get("license_header_invalid") or []
+            row.copyright_header_invalid_issues = stats.get("copyright_header_invalid") or []
+            row.report_text = report_text if report_text else None
             row.error_message = error_message
             row.updated_at = datetime.now(timezone.utc)
             session.commit()
             logger.info(
-                "_finish_oat_scan_result_sync — id=%s platform_task_id=%s status=%s total_issues=%d",
-                row.id, platform_task_id, status, stats.get("total_issues", 0),
+                "_finish_oat_scan_result_sync — id=%s platform_task_id=%s status=%s "
+                "total_issues=%d ift=%d lic=%d cp=%d",
+                row.id, platform_task_id, status,
+                stats.get("total_issues", 0),
+                len(row.invalid_file_type_issues),
+                len(row.license_header_invalid_issues),
+                len(row.copyright_header_invalid_issues),
             )
     except Exception as exc:
         logger.error(
@@ -418,13 +490,13 @@ def _run_oat_scan_sync(
         report_file = report_dir / f"PlainReport_{project_name}.txt"
         report_text = ""
         if report_file.exists():
-            raw = report_file.read_bytes()
-            report_text = raw[:_REPORT_MAX_BYTES].decode("utf-8", errors="replace")
+            report_text = report_file.read_text(encoding="utf-8", errors="replace")
 
         stats = _parse_report_stats(report_text)
+        issues = _parse_report_issues(report_text)
         logger.info(
-            "_run_oat_scan_sync done — project=%s exit_code=%d total_issues=%d",
-            project_name, exit_code, stats["total_issues"],
+            "_run_oat_scan_sync done — project=%s exit_code=%d total_issues=%d report_bytes=%d",
+            project_name, exit_code, stats["total_issues"], len(report_text.encode("utf-8")),
         )
         return {
             "exit_code": exit_code,
@@ -432,6 +504,7 @@ def _run_oat_scan_sync(
             "stdout_tail": stdout_tail,
             "report_text": report_text,
             **stats,
+            **issues,
         }
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)

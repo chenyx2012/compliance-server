@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.celery_app import celery_app
@@ -34,6 +34,7 @@ from app.schemas.oat_rule import (
     OatRuleConfigListResponse,
     OatRuleConfigResponse,
     OatRuleConfigUpdate,
+    OatScanResultListResponse,
     OatScanResultResponse,
 )
 
@@ -213,6 +214,166 @@ async def delete_oat_rule(
     await db.delete(row)
     await db.flush()
     logger.info("delete_oat_rule — id=%d name=%r", rule_id, row.name)
+
+
+# ===========================================================================
+# GET /platform/oat-scan-results  — 列表查询（多条件筛选 + 分页）
+# ===========================================================================
+
+@router.get(
+    "/platform/oat-scan-results",
+    response_model=OatScanResultListResponse,
+    summary="查询 OAT 扫描任务列表（多条件筛选 + 分页）",
+    tags=["oat-rules"],
+)
+async def list_oat_scan_results(
+    # ---- 分页 ----
+    page: int = Query(1, ge=1, description="页码，从 1 起"),
+    page_size: int = Query(20, ge=1, le=100, description="每页记录数，最大 100"),
+    # ---- 精确 / 模糊匹配 ----
+    platform_task_id: Optional[str] = Query(
+        None, description="按平台任务 ID 筛选（模糊匹配，支持部分输入）"
+    ),
+    status: Optional[str] = Query(
+        None, description="扫描状态筛选：running / success / failed / cancelled"
+    ),
+    rule_config_id: Optional[int] = Query(
+        None, description="按规则配置 ID 精确筛选；传 0 表示只查使用内置默认规则的记录"
+    ),
+    exit_code: Optional[int] = Query(
+        None, description="按 oat_python 退出码精确筛选（0=无问题，1=有issue）"
+    ),
+    # ---- 数值范围 ----
+    min_total_issues: Optional[int] = Query(
+        None, ge=0, description="issue 总数下限（含）"
+    ),
+    max_total_issues: Optional[int] = Query(
+        None, ge=0, description="issue 总数上限（含）"
+    ),
+    has_issues: Optional[bool] = Query(
+        None, description="true=只返回 total_issues>0；false=只返回 total_issues=0"
+    ),
+    # ---- 时间范围（ISO8601 字符串或 Unix 毫秒时间戳） ----
+    start_date: Optional[str] = Query(
+        None, description="created_at 起始时间（ISO8601 或 13 位毫秒时间戳）"
+    ),
+    end_date: Optional[str] = Query(
+        None, description="created_at 截止时间（ISO8601 或 13 位毫秒时间戳）"
+    ),
+    # ---- 排序 ----
+    sort_by: Optional[str] = Query(
+        "created_at",
+        description="排序字段：created_at / updated_at / total_issues / invalid_file_type_count / license_header_invalid_count / copyright_header_invalid_count",
+    ),
+    sort_order: Optional[str] = Query(
+        "desc", description="排序方向：asc / desc"
+    ),
+    db: AsyncSession = Depends(get_db),
+) -> OatScanResultListResponse:
+    """
+    OAT 扫描任务列表查询，支持多维度条件筛选与分页。
+
+    **筛选条件**
+    | 参数 | 说明 |
+    |---|---|
+    | platform_task_id | 模糊匹配平台任务 ID |
+    | status | 扫描状态（running/success/failed/cancelled） |
+    | rule_config_id | 规则配置 ID；传 `0` 表示内置默认规则（rule_config_id IS NULL） |
+    | exit_code | oat_python 退出码 |
+    | min_total_issues / max_total_issues | issue 数量范围 |
+    | has_issues | true=有issue，false=无issue |
+    | start_date / end_date | 创建时间范围 |
+
+    **排序**
+    - sort_by: created_at（默认）/ updated_at / total_issues / invalid_file_type_count / license_header_invalid_count / copyright_header_invalid_count
+    - sort_order: desc（默认）/ asc
+    """
+    stmt = select(OatScanResult)
+
+    # --- platform_task_id 模糊匹配 ---
+    if platform_task_id:
+        stmt = stmt.where(OatScanResult.platform_task_id.contains(platform_task_id))
+
+    # --- status ---
+    if status:
+        stmt = stmt.where(OatScanResult.status == status)
+
+    # --- rule_config_id（0 表示 NULL，即内置默认规则） ---
+    if rule_config_id is not None:
+        if rule_config_id == 0:
+            stmt = stmt.where(OatScanResult.rule_config_id.is_(None))
+        else:
+            stmt = stmt.where(OatScanResult.rule_config_id == rule_config_id)
+
+    # --- exit_code ---
+    if exit_code is not None:
+        stmt = stmt.where(OatScanResult.exit_code == exit_code)
+
+    # --- issue 数量范围 ---
+    if has_issues is True:
+        stmt = stmt.where(OatScanResult.total_issues > 0)
+    elif has_issues is False:
+        stmt = stmt.where(OatScanResult.total_issues == 0)
+    if min_total_issues is not None:
+        stmt = stmt.where(OatScanResult.total_issues >= min_total_issues)
+    if max_total_issues is not None:
+        stmt = stmt.where(OatScanResult.total_issues <= max_total_issues)
+
+    # --- 时间范围 ---
+    def _parse_dt(value: str) -> datetime:
+        """解析 ISO8601 字符串或 13 位毫秒时间戳。"""
+        from datetime import timezone as tz
+        stripped = value.strip()
+        if stripped.isdigit():
+            ts_sec = int(stripped) / 1000 if len(stripped) == 13 else int(stripped)
+            return datetime.fromtimestamp(ts_sec, tz=tz.utc).replace(tzinfo=None)
+        dt = datetime.fromisoformat(stripped.replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+
+    if start_date:
+        try:
+            stmt = stmt.where(OatScanResult.created_at >= _parse_dt(start_date))
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"Invalid start_date format: {start_date!r}")
+    if end_date:
+        try:
+            stmt = stmt.where(OatScanResult.created_at <= _parse_dt(end_date))
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"Invalid end_date format: {end_date!r}")
+
+    # --- 排序 ---
+    _sort_col_map = {
+        "created_at": OatScanResult.created_at,
+        "updated_at": OatScanResult.updated_at,
+        "total_issues": OatScanResult.total_issues,
+        "invalid_file_type_count": OatScanResult.invalid_file_type_count,
+        "license_header_invalid_count": OatScanResult.license_header_invalid_count,
+        "copyright_header_invalid_count": OatScanResult.copyright_header_invalid_count,
+    }
+    sort_col = _sort_col_map.get(sort_by or "created_at", OatScanResult.created_at)
+    stmt = stmt.order_by(sort_col.asc() if sort_order == "asc" else sort_col.desc())
+
+    # --- 统计总数 ---
+    count_stmt = select(func.count()).select_from(stmt.subquery())
+    total: int = (await db.execute(count_stmt)).scalar_one()
+
+    # --- 分页 ---
+    offset = (page - 1) * page_size
+    stmt = stmt.offset(offset).limit(page_size)
+    rows = (await db.execute(stmt)).scalars().all()
+
+    total_pages = max(1, (total + page_size - 1) // page_size)
+
+    from app.schemas.oat_rule import OatScanResultListItem
+    return OatScanResultListResponse(
+        total=total,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+        items=[OatScanResultListItem.model_validate(r) for r in rows],
+    )
 
 
 # ===========================================================================

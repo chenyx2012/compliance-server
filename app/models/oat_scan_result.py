@@ -3,6 +3,12 @@ OAT 扫描结果模型。
 
 每次 S1 扫描（oat_python 执行）完成后写入一条记录，
 与 platform_task 通过 platform_task_id 关联。
+
+三类 issue 的详情以 JSON 数组单独存储，格式：
+  [{"file": "路径", "content": "类型/许可证/版权内容", "project": "项目名"}, ...]
+  - invalid_file_type_issues          : Invalid File Type 问题列表
+  - license_header_invalid_issues     : License Header Invalid 问题列表
+  - copyright_header_invalid_issues   : Copyright Header Invalid 问题列表
 """
 
 from __future__ import annotations
@@ -10,7 +16,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import DateTime, Integer, String, Text
+from sqlalchemy import JSON, DateTime, Integer, String, Text
+from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -33,7 +40,10 @@ class OatScanResult(Base):
     - invalid_file_type_count    : 二进制/归档文件类型问题数
     - license_header_invalid_count  : License 头缺失/不合规数
     - copyright_header_invalid_count: Copyright 头缺失/不合规数
-    - report_text                : PlainReport_*.txt 内容（截断至 64 KB）
+    - invalid_file_type_issues          : Invalid File Type 问题 JSON 数组
+    - license_header_invalid_issues     : License Header Invalid 问题 JSON 数组
+    - copyright_header_invalid_issues   : Copyright Header Invalid 问题 JSON 数组
+    - report_text                : PlainReport_*.txt 完整内容（MEDIUMTEXT）
     - error_message              : 执行异常时的错误信息
     """
 
@@ -78,6 +88,31 @@ class OatScanResult(Base):
     copyright_header_invalid_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, comment="Copyright Header Invalid 问题数"
     )
+    # ── 三类问题详情 JSON（扫描完成后由 _parse_report_issues 填充）─────────────
+    # 新建表自动生效；若表已存在需执行：
+    #   ALTER TABLE oat_scan_result
+    #     ADD COLUMN invalid_file_type_issues JSON NULL,
+    #     ADD COLUMN license_header_invalid_issues JSON NULL,
+    #     ADD COLUMN copyright_header_invalid_issues JSON NULL;
+    invalid_file_type_issues: Mapped[Optional[list]] = mapped_column(
+        JSON,
+        nullable=True,
+        default=None,
+        comment="Invalid File Type 问题详情 [{file, content, project}, ...]",
+    )
+    license_header_invalid_issues: Mapped[Optional[list]] = mapped_column(
+        JSON,
+        nullable=True,
+        default=None,
+        comment="License Header Invalid 问题详情 [{file, content, project}, ...]",
+    )
+    copyright_header_invalid_issues: Mapped[Optional[list]] = mapped_column(
+        JSON,
+        nullable=True,
+        default=None,
+        comment="Copyright Header Invalid 问题详情 [{file, content, project}, ...]",
+    )
+
     celery_task_id: Mapped[Optional[str]] = mapped_column(
         String(255),
         nullable=True,
@@ -85,10 +120,13 @@ class OatScanResult(Base):
         comment="异步模式下对应的 Celery task id，用于取消/撤销任务",
     )
     report_text: Mapped[Optional[str]] = mapped_column(
-        Text,
+        # MEDIUMTEXT：MySQL 最大 16 MB，完整保存 PlainReport_*.txt 三类问题详情
+        # 新建表时自动生效；若表已存在，需手动执行：
+        #   ALTER TABLE oat_scan_result MODIFY COLUMN report_text MEDIUMTEXT;
+        Text().with_variant(MEDIUMTEXT(), "mysql"),
         nullable=True,
         default=None,
-        comment="PlainReport_*.txt 内容（截断至 64 KB）",
+        comment="PlainReport_*.txt 完整内容（三类 issue 详情，MySQL MEDIUMTEXT 最大 16MB）",
     )
     error_message: Mapped[Optional[str]] = mapped_column(
         String(2000),

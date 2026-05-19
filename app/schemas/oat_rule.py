@@ -5,7 +5,7 @@ OAT 规则配置与扫描结果相关 Pydantic 模型。
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -78,8 +78,24 @@ class BuiltinXmlResponse(BaseModel):
 # OAT 扫描结果
 # ---------------------------------------------------------------------------
 
+class OatIssueItem(BaseModel):
+    """单条 OAT issue 条目（三类问题通用）。"""
+
+    file: str = Field(..., description="问题文件路径（相对仓库根）")
+    content: str = Field(
+        ...,
+        description=(
+            "issue 具体内容：\n"
+            "  Invalid File Type       → 文件类型（如 unknown / binary）\n"
+            "  License Header Invalid  → 许可证标识（如 NoLicenseHeader / GPL-2.0-only）\n"
+            "  Copyright Header Invalid → 版权声明内容（如 NULL / Copyright 2024 Xxx）"
+        ),
+    )
+    project: str = Field(..., description="oat 扫描时使用的项目名称")
+
+
 class OatScanResultResponse(BaseModel):
-    """OAT 扫描结果详情响应。"""
+    """OAT 扫描结果详情响应（含三类 issue 结构化列表）。"""
 
     id: int
     platform_task_id: str
@@ -91,9 +107,48 @@ class OatScanResultResponse(BaseModel):
     invalid_file_type_count: int
     license_header_invalid_count: int
     copyright_header_invalid_count: int
+    # 三类问题结构化列表（None 表示旧数据尚未解析）
+    invalid_file_type_issues: Optional[List[OatIssueItem]] = None
+    license_header_invalid_issues: Optional[List[OatIssueItem]] = None
+    copyright_header_invalid_issues: Optional[List[OatIssueItem]] = None
     report_text: Optional[str]
     error_message: Optional[str]
     created_at: datetime
     updated_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class OatScanResultListItem(BaseModel):
+    """
+    OAT 扫描任务列表中的单条摘要。
+
+    不含 report_text（原始报告文本）和三类 issue 详情数组，减少列表传输量。
+    需要 issue 详情请通过 GET /platform/oat-scan-results/{task_id} 获取完整响应。
+    """
+
+    id: int
+    platform_task_id: str
+    rule_config_id: Optional[int]
+    celery_task_id: Optional[str]
+    status: str
+    exit_code: Optional[int]
+    total_issues: int
+    invalid_file_type_count: int
+    license_header_invalid_count: int
+    copyright_header_invalid_count: int
+    error_message: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class OatScanResultListResponse(BaseModel):
+    """OAT 扫描任务列表响应。"""
+
+    total: int = Field(..., description="符合筛选条件的总记录数")
+    page: int = Field(..., description="当前页码（从 1 起）")
+    page_size: int = Field(..., description="每页记录数")
+    total_pages: int = Field(..., description="总页数")
+    items: List[OatScanResultListItem]

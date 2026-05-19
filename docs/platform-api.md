@@ -26,7 +26,8 @@
   - [更新规则配置](#更新规则配置put-platformoat-rulesrule_id)
   - [删除规则配置](#删除规则配置delete-platformoat-rulesrule_id)
 - **OAT 扫描结果**
-  - [查询扫描结果](#查询扫描结果get-platformoat-scan-resultstask_id)
+  - [扫描任务列表查询](#扫描任务列表查询get-platformoat-scan-results)
+  - [查询单条扫描结果](#查询单条扫描结果get-platformoat-scan-resultstask_id)
   - [取消 S1 扫描](#取消-s1-扫描delete-platformtaskstask_ids1)
 - [数据模型参考](#数据模型参考)
 
@@ -80,6 +81,14 @@
     "invalid_file_type_count": 0,
     "license_header_invalid_count": 2,
     "copyright_header_invalid_count": 1,
+    "invalid_file_type_issues": [],
+    "license_header_invalid_issues": [
+      { "file": "src/utils.c", "content": "NoLicenseHeader", "project": "my-project" },
+      { "file": "src/core.c",  "content": "GPL-2.0-only",    "project": "my-project" }
+    ],
+    "copyright_header_invalid_issues": [
+      { "file": "src/utils.c", "content": "NULL", "project": "my-project" }
+    ],
     "rule_config_id": null
   },
   "sentry": {
@@ -770,9 +779,67 @@ const timer = setInterval(async () => {
 
 ---
 
-## 查询扫描结果（`GET /platform/oat-scan-results/{task_id}`）
+## 扫描任务列表查询（`GET /platform/oat-scan-results`）
 
-按 `platform_task_id` 查询最新一条 OAT（S1）扫描结果。
+多条件筛选 OAT 扫描任务列表，支持分页与排序。返回结果**不含**三类 issue 详情数组和原始报告文本（减少传输量），如需详情请调用单条接口。
+
+### 请求参数（Query，均可选）
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `page` | integer | 页码，从 1 开始，默认 `1` |
+| `page_size` | integer | 每页记录数，默认 `20`，最大 `100` |
+| `platform_task_id` | string | 按平台任务 ID **模糊匹配**（支持部分输入） |
+| `status` | string | 扫描状态：`running` / `success` / `failed` / `cancelled` |
+| `rule_config_id` | integer | 按规则配置 ID 精确筛选；传 `0` 表示只查使用**内置默认规则**（`rule_config_id IS NULL`）的记录 |
+| `exit_code` | integer | 按 oat_python 退出码精确筛选（`0`=无问题，`1`=有 issue） |
+| `min_total_issues` | integer | issue 总数下限（含） |
+| `max_total_issues` | integer | issue 总数上限（含） |
+| `has_issues` | boolean | `true`=只返回有 issue 的记录（`total_issues > 0`）；`false`=只返回无 issue 的记录 |
+| `start_date` | string | `created_at` 起始时间（ISO 8601 字符串 或 13 位毫秒时间戳） |
+| `end_date` | string | `created_at` 截止时间（格式同上） |
+| `sort_by` | string | 排序字段，默认 `created_at`；可选：`updated_at` / `total_issues` / `invalid_file_type_count` / `license_header_invalid_count` / `copyright_header_invalid_count` |
+| `sort_order` | string | 排序方向：`desc`（默认）/ `asc` |
+
+### 响应（200）
+
+```json
+{
+  "total": 86,
+  "page": 1,
+  "page_size": 20,
+  "total_pages": 5,
+  "items": [
+    {
+      "id": 42,
+      "platform_task_id": "pt-a1b2c3d4...",
+      "rule_config_id": null,
+      "celery_task_id": "celery-uuid-xxxx",
+      "status": "success",
+      "exit_code": 1,
+      "total_issues": 5,
+      "invalid_file_type_count": 0,
+      "license_header_invalid_count": 3,
+      "copyright_header_invalid_count": 2,
+      "error_message": null,
+      "created_at": "2026-05-19T10:00:00Z",
+      "updated_at": "2026-05-19T10:05:00Z"
+    }
+  ]
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `total` | 符合筛选条件的总记录数 |
+| `total_pages` | 总页数 |
+| `items` | 当前页记录列表（摘要，不含 issue 详情数组） |
+
+---
+
+## 查询单条扫描结果（`GET /platform/oat-scan-results/{task_id}`）
+
+按 `platform_task_id` 查询最新一条 OAT（S1）扫描结果，返回完整内容，包含三类 issue 结构化详情和原始报告文本。
 
 **路径参数：**
 
@@ -790,25 +857,67 @@ const timer = setInterval(async () => {
   "celery_task_id": "celery-uuid-xxxx",
   "status": "success",
   "exit_code": 1,
-  "total_issues": 3,
+  "total_issues": 5,
   "invalid_file_type_count": 0,
-  "license_header_invalid_count": 2,
-  "copyright_header_invalid_count": 1,
-  "report_text": "Invalid File Type Total Count: 0\n\nLicense Header Invalid Total Count: 2\n...",
+  "license_header_invalid_count": 3,
+  "copyright_header_invalid_count": 2,
+  "invalid_file_type_issues": [],
+  "license_header_invalid_issues": [
+    { "file": "src/utils.c",      "content": "NoLicenseHeader", "project": "my-repo" },
+    { "file": "src/network/tcp.c","content": "GPL-2.0-only",    "project": "my-repo" },
+    { "file": "src/core/mem.c",   "content": "InvalidLicense",  "project": "my-repo" }
+  ],
+  "copyright_header_invalid_issues": [
+    { "file": "src/utils.c",   "content": "NULL",               "project": "my-repo" },
+    { "file": "src/core/mem.c","content": "Copyright 2020 Acme","project": "my-repo" }
+  ],
+  "report_text": "...(PlainReport_*.txt 完整内容)...",
   "error_message": null,
   "created_at": "2026-05-11T10:00:00Z",
   "updated_at": "2026-05-11T10:05:00Z"
 }
 ```
 
+**顶层字段说明：**
+
 | 字段 | 说明 |
 |------|------|
 | `status` | `running` / `success` / `failed` / `cancelled` |
-| `exit_code` | oat_python 退出码：`0`=无问题，`1`=有 issue，`-1`=超时，`null`=未完成 |
+| `exit_code` | oat_python 退出码：`0`=无问题，`1`=有 issue，`-1`=超时/崩溃，`null`=未完成 |
 | `total_issues` | 三类 issue 之和（`0` 表示完全合规） |
-| `report_text` | `PlainReport_*.txt` 内容（最长 64 KB），含问题明细 |
 | `rule_config_id` | 使用的规则配置 ID，`null` 表示内置默认规则 |
 | `celery_task_id` | 异步模式下的 Celery task ID |
+| `report_text` | `PlainReport_*.txt` 完整原始内容（MySQL MEDIUMTEXT，最大 16 MB） |
+| `error_message` | 扫描执行异常时的错误说明 |
+
+**三类 issue 详情数组：**
+
+> `null` 表示该记录为旧数据（功能上线前产生），尚未解析；`[]` 表示该类无问题。
+
+| 字段 | 说明 |
+|------|------|
+| `invalid_file_type_issues` | 文件类型不合规问题列表 |
+| `license_header_invalid_issues` | License 头缺失/不合规问题列表 |
+| `copyright_header_invalid_issues` | Copyright 头缺失/不合规问题列表 |
+
+**issue 条目字段：**
+
+| 字段 | 说明 |
+|------|------|
+| `file` | 问题文件路径（相对仓库根） |
+| `content` | issue 具体内容（含义随类型不同，见下表） |
+| `project` | oat 扫描时使用的项目名称 |
+
+**`content` 含义说明：**
+
+| 类型 | `content` 示例 | 含义 |
+|------|---------------|------|
+| `invalid_file_type_issues` | `unknown` / `binary` | 识别到的文件类型 |
+| `license_header_invalid_issues` | `NoLicenseHeader` | 文件缺少 License 声明头 |
+| | `InvalidLicense` | 存在许可证声明但格式/内容不合规 |
+| | `GPL-2.0-only` | 文件使用了该许可证（可能未通过兼容性检查） |
+| `copyright_header_invalid_issues` | `NULL` | 文件缺少 Copyright 声明头 |
+| | `Copyright 2024 Xxx` | 版权声明内容（多个所有者以 ` \|` 分隔） |
 
 **错误响应：**
 
@@ -898,6 +1007,39 @@ const timer = setInterval(async () => {
 | `success` | 扫描完成（可能有 issue，见各服务结果表） |
 | `failed` | 扫描失败或被取消 |
 | `skipped` | 当前任务未选用该服务 |
+
+### `oat_scan_result` 表关键字段
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | integer | 自增主键 |
+| `platform_task_id` | string | 关联 `platform_task.task_id` |
+| `rule_config_id` | integer \| null | 使用的规则配置 ID；`null` = 内置默认规则 |
+| `status` | string | `running` / `success` / `failed` / `cancelled` |
+| `exit_code` | integer \| null | oat_python 进程退出码（`0`=无问题，`1`=有 issue，`-1`=超时，`null`=未完成） |
+| `total_issues` | integer | 三类 issue 之和 |
+| `invalid_file_type_count` | integer | Invalid File Type 问题数 |
+| `license_header_invalid_count` | integer | License Header Invalid 问题数 |
+| `copyright_header_invalid_count` | integer | Copyright Header Invalid 问题数 |
+| `invalid_file_type_issues` | JSON \| null | Invalid File Type 问题详情列表；`null` 表示旧数据未解析 |
+| `license_header_invalid_issues` | JSON \| null | License Header Invalid 问题详情列表 |
+| `copyright_header_invalid_issues` | JSON \| null | Copyright Header Invalid 问题详情列表 |
+| `report_text` | text \| null | PlainReport_*.txt 完整内容（MySQL MEDIUMTEXT，最大 16 MB） |
+| `celery_task_id` | string \| null | 异步模式下的 Celery task ID |
+| `error_message` | string \| null | 执行异常时的错误信息 |
+| `created_at` | datetime | 记录创建时间（UTC） |
+| `updated_at` | datetime | 最后更新时间（UTC） |
+
+> **数据库迁移说明（已存在的表）：**  
+> 首次部署上线时需手动执行以下 SQL：
+> ```sql
+> ALTER TABLE oat_scan_result
+>   MODIFY COLUMN report_text MEDIUMTEXT
+>     COMMENT 'PlainReport_*.txt 完整内容（MEDIUMTEXT 最大 16MB）',
+>   ADD COLUMN invalid_file_type_issues        JSON NULL COMMENT 'Invalid File Type 问题详情',
+>   ADD COLUMN license_header_invalid_issues   JSON NULL COMMENT 'License Header Invalid 问题详情',
+>   ADD COLUMN copyright_header_invalid_issues JSON NULL COMMENT 'Copyright Header Invalid 问题详情';
+> ```
 
 ### `oat_scan_result.status` 值
 
