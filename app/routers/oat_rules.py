@@ -234,6 +234,9 @@ async def list_oat_scan_results(
     platform_task_id: Optional[str] = Query(
         None, description="按平台任务 ID 筛选（模糊匹配，支持部分输入）"
     ),
+    task_name: Optional[str] = Query(
+        None, description="按任务名称筛选（模糊匹配，关联 platform_task.task_name）"
+    ),
     status: Optional[str] = Query(
         None, description="扫描状态筛选：running / success / failed / cancelled"
     ),
@@ -288,11 +291,17 @@ async def list_oat_scan_results(
     - sort_by: created_at（默认）/ updated_at / total_issues / invalid_file_type_count / license_header_invalid_count / copyright_header_invalid_count
     - sort_order: desc（默认）/ asc
     """
-    stmt = select(OatScanResult)
+    stmt = (
+        select(OatScanResult, PlatformTask.task_name.label("task_name"))
+        .select_from(OatScanResult)
+        .outerjoin(PlatformTask, PlatformTask.task_id == OatScanResult.platform_task_id)
+    )
 
     # --- platform_task_id 模糊匹配 ---
     if platform_task_id:
         stmt = stmt.where(OatScanResult.platform_task_id.contains(platform_task_id))
+    if task_name:
+        stmt = stmt.where(PlatformTask.task_name.contains(task_name))
 
     # --- status ---
     if status:
@@ -362,17 +371,26 @@ async def list_oat_scan_results(
     # --- 分页 ---
     offset = (page - 1) * page_size
     stmt = stmt.offset(offset).limit(page_size)
-    rows = (await db.execute(stmt)).scalars().all()
+    rows = (await db.execute(stmt)).all()
 
     total_pages = max(1, (total + page_size - 1) // page_size)
 
     from app.schemas.oat_rule import OatScanResultListItem
+    items = []
+    for oat_row, task_name_value in rows:
+        payload = {
+            c.name: getattr(oat_row, c.name)
+            for c in OatScanResult.__table__.columns
+        }
+        payload["task_name"] = task_name_value
+        items.append(OatScanResultListItem.model_validate(payload))
+
     return OatScanResultListResponse(
         total=total,
         page=page,
         page_size=page_size,
         total_pages=total_pages,
-        items=[OatScanResultListItem.model_validate(r) for r in rows],
+        items=items,
     )
 
 
@@ -392,18 +410,26 @@ async def get_oat_scan_result(
 ) -> OatScanResultResponse:
     """按 platform_task_id 查询最新一条 OAT 扫描结果。"""
     result = await db.execute(
-        select(OatScanResult)
+        select(OatScanResult, PlatformTask.task_name.label("task_name"))
+        .select_from(OatScanResult)
+        .outerjoin(PlatformTask, PlatformTask.task_id == OatScanResult.platform_task_id)
         .where(OatScanResult.platform_task_id == task_id)
         .order_by(OatScanResult.created_at.desc())
         .limit(1)
     )
-    row = result.scalar_one_or_none()
+    row = result.first()
     if row is None:
         raise HTTPException(
             status_code=404,
             detail=f"No OAT scan result found for task_id={task_id!r}",
         )
-    return OatScanResultResponse.model_validate(row)
+    oat_row, task_name_value = row
+    payload = {
+        c.name: getattr(oat_row, c.name)
+        for c in OatScanResult.__table__.columns
+    }
+    payload["task_name"] = task_name_value
+    return OatScanResultResponse.model_validate(payload)
 
 
 # ===========================================================================

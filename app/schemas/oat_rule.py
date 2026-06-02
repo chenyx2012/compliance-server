@@ -99,6 +99,7 @@ class OatScanResultResponse(BaseModel):
 
     id: int
     platform_task_id: str
+    task_name: Optional[str] = Field(None, description="关联平台任务名称")
     rule_config_id: Optional[int]
     celery_task_id: Optional[str]
     status: str
@@ -129,6 +130,7 @@ class OatScanResultListItem(BaseModel):
 
     id: int
     platform_task_id: str
+    task_name: Optional[str] = Field(None, description="关联平台任务名称")
     rule_config_id: Optional[int]
     celery_task_id: Optional[str]
     status: str
