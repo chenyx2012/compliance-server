@@ -39,8 +39,10 @@ class PlatformTaskResponse(BaseModel):
     s3_status: ServiceStatus
     s4_status: ServiceStatus
     s5_status: ServiceStatus
-    # compliance-sentry 侧分析任务 ID，由 mission 提交成功后写入
-    s3_analysis_id: Optional[str] = Field(None, description="compliance-sentry analysis_id，可用于直接查询 sentry 扫描进度")
+    s3_analysis_id: Optional[str] = Field(None, description="compliance-sentry analysis_id")
+    s3_has_conflicts: Optional[bool] = None
+    s3_conflict_count: int = 0
+    target_repo_name: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     deleted_at: Optional[datetime]
@@ -70,9 +72,9 @@ class ServiceStatusUpdateRequest(BaseModel):
     """
 
     service: ServiceName = Field(..., description="服务标识：S1 / S2 / S3 / S4 / S5")
-    status: ServiceStatus = Field(
+    status: str = Field(
         ...,
-        description="服务最新状态：running / success / failed / skipped",
+        description="服务最新状态；completed/terminated 会映射为 success/failed",
     )
     message: Optional[str] = Field(
         None,

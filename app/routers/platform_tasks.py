@@ -22,6 +22,14 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.models.oat_scan_result import OatScanResult
 from app.models.platform_task import PlatformTask, derive_task_status
+from app.models.scan_result_code_clone import ScanResultCodeClone
+from app.core.time_utils import beijing_now
+
+SENTRY_STATUS_MAP = {
+    "completed": "success",
+    "failed": "failed",
+    "terminated": "failed",
+}
 from app.schemas.platform_task import (
     AllServicesRiskStats,
     ComplianceTrendResponse,
@@ -149,6 +157,7 @@ async def query_platform_tasks(
     s3_status: Optional[str] = Query(None, description="S3 服务状态过滤"),
     s4_status: Optional[str] = Query(None, description="S4 服务状态过滤"),
     s5_status: Optional[str] = Query(None, description="S5 服务状态过滤"),
+    target_repo_name: Optional[str] = Query(None, description="片段扫描目标知识库名"),
     created_after: Optional[datetime] = Query(
         None, description="创建时间下限（ISO 8601，含）"
     ),
@@ -192,6 +201,8 @@ async def query_platform_tasks(
         conditions.append(PlatformTask.s4_status == s4_status)
     if s5_status:
         conditions.append(PlatformTask.s5_status == s5_status)
+    if target_repo_name:
+        conditions.append(PlatformTask.target_repo_name == target_repo_name)
     if created_after:
         conditions.append(PlatformTask.created_at >= created_after)
     if created_before:
@@ -227,6 +238,44 @@ async def query_platform_tasks(
         page_size=page_size,
         items=[PlatformTaskResponse.model_validate(r) for r in rows],
     )
+
+
+# ===========================================================================
+# GET /platform/tasks/ids  — 从克隆结果去重取 task_id
+# ===========================================================================
+
+@router.get(
+    "/platform/tasks/ids",
+    summary="从 scan_result_code_clone 去重取 task_id 列表",
+    tags=["platform-tasks"],
+)
+async def list_task_ids_from_clones(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+) -> Dict[str, Any]:
+    # DISTINCT task_id + LEFT JOIN platform_task 取 task_name
+    base = (
+        select(
+            ScanResultCodeClone.task_id,
+            func.coalesce(PlatformTask.task_name, "").label("task_name"),
+        )
+        .select_from(ScanResultCodeClone)
+        .outerjoin(PlatformTask, PlatformTask.task_id == ScanResultCodeClone.task_id)
+        .distinct()
+    )
+    # 计数
+    count_q = select(func.count()).select_from(base.subquery())
+    total = (await db.execute(count_q)).scalar_one()
+    rows = (
+        await db.execute(base.offset((page - 1) * page_size).limit(page_size))
+    ).all()
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "items": [{"task_id": r.task_id, "task_name": r.task_name} for r in rows],
+    }
 
 
 # ===========================================================================
@@ -289,12 +338,13 @@ async def update_service_status(
 
     service_field = f"{body.service.lower()}_status"  # e.g. s3_status
     old_svc_status = getattr(pt, service_field)
-    setattr(pt, service_field, body.status)
+    mapped_status = SENTRY_STATUS_MAP.get(body.status, body.status)
+    setattr(pt, service_field, mapped_status)
 
     # 推导新的任务整体状态
     new_task_status = derive_task_status(pt)
     pt.task_status = new_task_status
-    pt.updated_at = datetime.now(timezone.utc)
+    pt.updated_at = beijing_now()
 
     await db.flush()
 
@@ -311,7 +361,7 @@ async def update_service_status(
     return ServiceStatusUpdateResponse(
         task_id=task_id,
         service=body.service,
-        service_status=body.status,
+        service_status=mapped_status,
         task_status=new_task_status,
         updated_at=pt.updated_at,
     )

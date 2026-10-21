@@ -1,30 +1,92 @@
 # ========================================
-# Python 虚拟环境
+# 环境与密钥（保留 .env.example）
+# ========================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets/
+
+# ========================================
+# Python 虚拟环境 / 打包
 # ========================================
 venv/
 .venv/
 env/
 ENV/
 virtualenv/
-.env
-
-# ========================================
-# Python 编译文件
-# ========================================
-**/__pycache__/
-*.pyc
-*.pyo
-*.pyd
 .Python
-*.so
 *.egg
 *.egg-info/
+.eggs/
 dist/
 build/
-.eggs/
-*.zip
+pip-wheel-metadata/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
 
 # ========================================
-# 项目特定 - 分析结果和上传文件
+# 测试 / 覆盖率 / 类型检查缓存
 # ========================================
-server/*
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.hypothesis/
+.cache/
+
+# ========================================
+# IDE / OS
+# ========================================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ========================================
+# 运行日志与本地状态
+# ========================================
+*.log
+logs/
+*.pid
+celerybeat-schedule
+celerybeat-schedule.*
+celerybeat.pid
+dump.rdb
+*.sqlite
+*.sqlite3
+*.db
+
+# ========================================
+# 运行时临时产物（解析/入库中转，非部署资产）
+# ========================================
+temp/
+tmp/
+temp_uploads/
+uploads/
+*.csv
+*.zip
+!docs/**/*.zip
+
+# ========================================
+# 本地旁路大目录（不随网关部署）
+# - server/：compliance-sentry 源码镜像，独立部署
+# - tools/：根目录 OAT 副本；运行用的是 app/tools/oat_python
+# ========================================
+/server/
+/tools/

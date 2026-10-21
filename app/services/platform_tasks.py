@@ -25,8 +25,8 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# 轮询间隔（秒）和最大轮询次数（默认 120 次 × 10s = 20 分钟）
-_POLL_INTERVAL = 60
+# 轮询间隔（秒）和最大轮询次数（规格：30s × 120 ≈ 60 分钟）
+_POLL_INTERVAL = 30
 _POLL_MAX_RETRIES = 120
 
 

@@ -41,11 +41,13 @@ from app.core.database import get_db
 from app.models.file_ingest import FileIngestResult
 from app.models.oat_scan_result import OatScanResult
 from app.models.platform_task import PlatformTask, derive_task_status
-from app.services.file_ingest import ingest_from_upload, ingest_from_url
+from app.services.file_ingest import ingest_from_upload, ingest_from_url, save_code_tree
 from app.services.oat_scanner import oat_scan_task, run_oat_scan
 from app.services.platform_tasks import sentry_mission_task
 from app.services.sentry_auth import get_token
 from app.services.sentry_proxy import proxy_to_sentry, proxy_to_sentry_noauth
+from app.tasks.file_ingest_tasks import save_file_ingest_result
+from app.tasks.s2_scan_tasks import s2_scan_task
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["compliance-sentry", "platform"])
@@ -677,6 +679,25 @@ async def compliance_sentry_proxy_fallback(path: str, request: Request):
 # 平台专属接口
 # ===========================================================================
 
+def _build_business_key(
+    *,
+    scan_mode: str,
+    repo_name: Optional[str],
+    pr_number: Optional[str],
+    commit_sha: Optional[str],
+    version_tag: Optional[str],
+) -> Optional[str]:
+    repo = (repo_name or "").strip()
+    if scan_mode == "pr":
+        if repo and commit_sha:
+            pr = (pr_number or "").strip() or "0"
+            return f"{repo}@pr#{pr}@{commit_sha.strip()}"
+        return None
+    if scan_mode == "version" and repo and version_tag:
+        return f"{repo}@version@{version_tag.strip()}"
+    return None
+
+
 @router.post(
     "/platform/tasks",
     summary="平台任务总入口（文件入库 + 可选触发 sentry/OAT 扫描）",
@@ -703,20 +724,35 @@ async def platform_tasks(
             "不传则使用 oat_python 内置默认规则。"
         ),
     ),
+    target_repo_name: Optional[str] = Form(None, description="片段扫描目标知识库名"),
+    scan_mode: str = Form("version", description="pr=社区增量 / version=版本全量"),
+    repo_name: Optional[str] = Form(None, description="仓库名（幂等键）"),
+    pr_number: Optional[str] = Form(None, description="PR 号"),
+    commit_sha: Optional[str] = Form(None, description="提交 SHA（PR 幂等）"),
+    version_tag: Optional[str] = Form(None, description="版本 tag"),
+    base_ref: Optional[str] = Form(None, description="PR 增量基线 ref（如 merge-base）"),
+    head_ref: Optional[str] = Form(None, description="PR head ref / commit"),
     db: AsyncSession = Depends(get_db),
 ) -> Dict[str, Any]:
     """
     平台任务总入口（支持异步）：
-    1. 根据 file 或 source_url 拉取代码并解析目录树，写入 MySQL（ingest_id）；
-    2. 若 services 包含 `S1`（OAT）：对源码执行开源合规扫描，支持自定义规则；
-    3. 若 services 包含 `S3`（compliance-sentry）：再向 sentry 提交 mission/upload（zip）或 mission/git（仓库地址）。
+    1. 根据 file 或 source_url 拉取代码；同步写 ingest + save_code_tree；
+    2. S1=OAT / S2=AICodeScan / S3=compliance-sentry。
+    scan_mode=pr 且提供 base_ref/head_ref 时打包增量 zip。
     """
+    import uuid as _uuid
+
+    from sqlalchemy import select as sa_select
+
+    scan_mode_norm = (scan_mode or "version").strip().lower()
+    if scan_mode_norm not in {"pr", "version"}:
+        raise HTTPException(status_code=400, detail="scan_mode must be pr or version")
+
     services_norm = []
     for s in services:
         if s is None:
             continue
         sn = s.strip().upper()
-        # 兼容前端可能一次提交逗号分隔字符串的情况
         if "," in sn:
             services_norm.extend([x.strip() for x in sn.split(",") if x.strip()])
         else:
@@ -724,25 +760,49 @@ async def platform_tasks(
     allowed = {"S1", "S2", "S3", "S4"}
     invalid = [s for s in services_norm if s not in allowed]
     if invalid:
-        raise HTTPException(status_code=400, detail=f"invalid services: {invalid}, allowed: {sorted(allowed)}")
+        raise HTTPException(status_code=400, detail=f"invalid services: {invalid}")
     if not services_norm:
         raise HTTPException(status_code=400, detail="services must not be empty")
 
     services_set = set(services_norm)
     want_s1 = "S1" in services_set
+    want_s2 = "S2" in services_set
     want_s3 = "S3" in services_set
 
+    biz_key = _build_business_key(
+        scan_mode=scan_mode_norm,
+        repo_name=repo_name,
+        pr_number=pr_number,
+        commit_sha=commit_sha,
+        version_tag=version_tag,
+    )
+    if biz_key:
+        existing = (
+            await db.execute(sa_select(PlatformTask).where(PlatformTask.business_key == biz_key))
+        ).scalar_one_or_none()
+        if existing is not None and existing.deleted_at is None:
+            return {
+                "status": "success",
+                "idempotent": True,
+                "message": "duplicate business_key; return existing task",
+                "ingest_id": existing.ingest_id,
+                "task_id": existing.task_id,
+                "platform_task_id": existing.task_id,
+                "business_key": biz_key,
+                "scan_mode": existing.scan_mode,
+                "s2_status": existing.s2_status,
+                "services": services_norm,
+            }
+
     logger.info(
-        "platform_tasks start — task_name=%s services=%s want_s1=%s want_s3=%s async_scan=%s source_url=%s file=%s",
+        "platform_tasks start — task_name=%s services=%s mode=%s biz=%s async_scan=%s",
         task_name,
         services_norm,
-        want_s1,
-        want_s3,
+        scan_mode_norm,
+        biz_key,
         async_scan,
-        source_url,
-        file.filename if file else None,
     )
-    
+
     if (not source_url or not source_url.strip()) and file is None:
         raise HTTPException(status_code=400, detail="provide source_url (git) or file")
     if source_url and source_url.strip() and file is not None:
@@ -754,39 +814,78 @@ async def platform_tasks(
     # --- ingest ---
     if source_url and source_url.strip():
         try:
-            tree, meta = await ingest_from_url(source_url.strip(), timeout_seconds=300)
+            meta, root_path = await ingest_from_url(
+                source_url.strip(),
+                timeout_seconds=300,
+                base_ref=base_ref,
+                head_ref=head_ref or commit_sha,
+                incremental=(scan_mode_norm == "pr"),
+            )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
     else:
         assert file is not None
         file_bytes = await file.read()
         upload_filename = file.filename or "upload.bin"
-        tree, meta = await ingest_from_upload(upload_filename, file_bytes)
+        meta, root_path = await ingest_from_upload(upload_filename, file_bytes)
 
+    # 规格：平台任务 task_id 为裸 UUID
+    task_id = str(_uuid.uuid4())
     source_type = meta.get("source", "unknown")
     source_label = meta.get("url") or meta.get("filename") or ""
-    s3_status = meta.get("s3_upload", "Unknown")
-    row = FileIngestResult(
-        source_type=source_type,
-        source_label=(source_label[:512] if source_label else None),
-        meta=meta,
-        tree=tree,
-        s3_upload_status=s3_status,
-        status=1,
-    )
-    db.add(row)
-    await db.flush()
-    ingest_id = str(row.id)
+    s3_upload_status = str(meta.get("s3_upload", "Unknown"))
 
-    logger.info(
-        "platform_tasks — ingest complete — ingest_id=%s task_name=%s source_type=%s source_label=%s s3_status=%s",
-        ingest_id, task_name, source_type, source_label[:50] if source_label else "N/A", s3_status
-    )
+    # 同步写 ingest，便于 code_file.ingest_id 关联
+    ingest_id: Optional[str] = None
+    try:
+        row = FileIngestResult(
+            source_type=source_type,
+            source_label=source_label[:512] if source_label else None,
+            meta=meta,
+            tree=None,
+            s3_upload_status=s3_upload_status[:512] if s3_upload_status else None,
+            source_file_path=root_path,
+            task_id=task_id,
+            status=1,
+        )
+        db.add(row)
+        await db.flush()
+        ingest_id = str(row.id)
+    except Exception as e:
+        logger.warning("sync ingest write failed, fallback celery — %s", e)
+        save_file_ingest_result.delay(
+            source_type=source_type,
+            source_label=source_label,
+            meta=meta,
+            s3_upload_status=s3_upload_status,
+            source_file_path=root_path,
+            task_id=task_id,
+            status=1,
+        )
 
-    # --- 创建平台任务记录 ---
+    # 同步存代码树（带 ingest_id）
+    try:
+        save_code_tree(
+            Path(root_path),
+            ingest_id=int(ingest_id) if ingest_id else None,
+            task_id=task_id,
+        )
+    except Exception as e:
+        logger.warning("save_code_tree failed — task_id=%s err=%s", task_id, e)
+
+    # --- 创建平台任务记录（显式指定裸 UUID task_id）---
     pt = PlatformTask(
+        task_id=task_id,
         task_name=task_name,
         ingest_id=ingest_id,
+        target_repo_name=target_repo_name,
+        scan_mode=scan_mode_norm,
+        business_key=biz_key,
+        repo_name=repo_name,
+        pr_number=pr_number,
+        commit_sha=commit_sha,
+        version_tag=version_tag,
+        s2_postprocess_status="pending" if want_s2 else "skipped",
         s1_status="pending" if "S1" in services_set else "skipped",
         s2_status="pending" if "S2" in services_set else "skipped",
         s3_status="pending" if "S3" in services_set else "skipped",
@@ -797,19 +896,20 @@ async def platform_tasks(
     await db.flush()
     platform_task_id = pt.task_id
     logger.info(
-        "platform_tasks — task record created — platform_task_id=%s ingest_id=%s task_name=%s services=%s",
-        platform_task_id, ingest_id, task_name, services_norm,
+        "platform_tasks — task record created — platform_task_id=%s task_name=%s services=%s",
+        platform_task_id, task_name, services_norm,
     )
 
     out: Dict[str, Any] = {
         "status": "success",
-        "platform_task_id": platform_task_id,
         "ingest_id": ingest_id,
+        "task_id": platform_task_id,
+        "platform_task_id": platform_task_id,
         "meta": meta,
-        "tree": tree,
         "services": services_norm,
-        # 兼容旧字段：单服务情况下仍可用于前端展示
-        "service": "compliance-sentry" if want_s3 else "none",
+        "scan_mode": scan_mode_norm,
+        "business_key": biz_key,
+        "service": "ai-code-scan" if want_s2 else ("compliance-sentry" if want_s3 else "none"),
     }
 
     # ===========================================================================
@@ -828,6 +928,51 @@ async def platform_tasks(
             async_scan=async_scan,
             db=db,
         )
+
+    # ===========================================================================
+    # S2：AICodeScan 片段扫描
+    # ===========================================================================
+    if want_s2:
+        s3_path = meta.get("s3_path")
+        if not s3_path:
+            out["warning"] = "s3_path not found in meta, skip scan"
+            out["hint"] = (
+                "configure MinIO: S3_ENDPOINT_URL / S3_ACCESS_KEY / S3_SECRET_KEY / S3_BUCKET_NAME"
+            )
+        else:
+            try:
+                from app.tasks.s2_scan_tasks import build_s2_scan_payload, resolve_s2_queue
+
+                upload_path = (
+                    f"/{settings.effective_s3_uploader_bucket_name}/"
+                    f"{settings.effective_s3_uploader_bucket_path}"
+                )
+                payload = build_s2_scan_payload(
+                    task_id=platform_task_id,
+                    download_path=str(s3_path),
+                    upload_path=upload_path,
+                    sync=False,
+                    scan_mode=scan_mode_norm,
+                )
+                queue = resolve_s2_queue(scan_mode_norm)
+                ar = s2_scan_task.apply_async(
+                    args=[platform_task_id, str(s3_path), upload_path, payload, scan_mode_norm],
+                    queue=queue,
+                )
+                out["s2_async"] = True
+                out["s2_task_id"] = ar.id
+                out["s2_queue"] = queue
+                out["scan"] = {
+                    "status": "queued",
+                    "celery_task_id": ar.id,
+                    "s3_path": s3_path,
+                    "queue": queue,
+                    "scan_mode": scan_mode_norm,
+                }
+            except Exception as e:
+                logger.exception("S2 submit failed: %s", e)
+                out["status"] = "error"
+                out["error"] = str(e)
 
     if not want_s3:
         logger.info(
@@ -1055,6 +1200,100 @@ def platform_task_result(task_id: str) -> Dict[str, Any]:
     if r.state == "FAILURE":
         return {"task_id": task_id, "state": r.state, "error": str(r.result)}
     return {"task_id": task_id, "state": r.state, "result": r.result}
+
+
+from pydantic import BaseModel, Field
+
+
+class PrScanWebhookRequest(BaseModel):
+    """社区 CI / webhook：PR 增量扫描入口。"""
+
+    task_name: str = Field(..., description="任务名")
+    source_url: str = Field(..., description="Git 仓库 URL")
+    repo_name: str = Field(..., description="仓库名")
+    pr_number: str = Field(..., description="PR 号")
+    commit_sha: str = Field(..., description="head commit")
+    base_ref: Optional[str] = Field(None, description="diff 基线")
+    head_ref: Optional[str] = Field(None, description="diff head，默认 commit_sha")
+    services: List[str] = Field(default_factory=lambda: ["S2"], description="默认仅 S2")
+    target_repo_name: Optional[str] = None
+
+
+class VersionScanWebhookRequest(BaseModel):
+    """版本全量扫描入口。"""
+
+    task_name: str
+    source_url: str
+    repo_name: str
+    version_tag: str
+    services: List[str] = Field(default_factory=lambda: ["S1", "S2", "S3"])
+    target_repo_name: Optional[str] = None
+
+
+@router.post(
+    "/platform/webhooks/pr-scan",
+    summary="社区 PR 增量扫描 webhook（202 受理）",
+    tags=["platform"],
+)
+async def webhook_pr_scan(
+    body: PrScanWebhookRequest,
+    db: AsyncSession = Depends(get_db),
+) -> Dict[str, Any]:
+    return await platform_tasks(
+        task_name=body.task_name,
+        services=body.services or ["S2"],
+        async_scan=True,
+        source_url=body.source_url,
+        file=None,
+        third_party=False,
+        fallback_tree=False,
+        branch_tag=None,
+        shadow_file=None,
+        license_shadow=None,
+        s1_rule_config_id=None,
+        target_repo_name=body.target_repo_name,
+        scan_mode="pr",
+        repo_name=body.repo_name,
+        pr_number=body.pr_number,
+        commit_sha=body.commit_sha,
+        version_tag=None,
+        base_ref=body.base_ref,
+        head_ref=body.head_ref or body.commit_sha,
+        db=db,
+    )
+
+
+@router.post(
+    "/platform/webhooks/version-scan",
+    summary="版本全量扫描 webhook",
+    tags=["platform"],
+)
+async def webhook_version_scan(
+    body: VersionScanWebhookRequest,
+    db: AsyncSession = Depends(get_db),
+) -> Dict[str, Any]:
+    return await platform_tasks(
+        task_name=body.task_name,
+        services=body.services or ["S1", "S2", "S3"],
+        async_scan=True,
+        source_url=body.source_url,
+        file=None,
+        third_party=False,
+        fallback_tree=False,
+        branch_tag=body.version_tag,
+        shadow_file=None,
+        license_shadow=None,
+        s1_rule_config_id=None,
+        target_repo_name=body.target_repo_name,
+        scan_mode="version",
+        repo_name=body.repo_name,
+        pr_number=None,
+        commit_sha=None,
+        version_tag=body.version_tag,
+        base_ref=None,
+        head_ref=None,
+        db=db,
+    )
 
 
 # ===========================================================================

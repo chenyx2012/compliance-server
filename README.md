@@ -60,31 +60,44 @@ copy .env.example .env
 
 编辑 `.env` 配置 Redis 与 **MySQL**（`MYSQL_HOST` / `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DATABASE` 等）。需先创建库：`CREATE DATABASE compliance_gateway CHARACTER SET utf8mb4;`
 
-### 3) 启动 Redis
-
-任选一种方式，保证 `.env` 中 `REDIS_URL` 可连即可：
-
-- **Docker（Windows / Linux 通用）：**
+### 3) 启动 Redis + MinIO
 
 ```bash
 docker compose up -d
 ```
 
-- 或本机安装 Redis 并启动服务
+会启动：
+
+| 服务 | 地址 | 说明 |
+|------|------|------|
+| Redis | `127.0.0.1:6379` | Celery broker |
+| MinIO API | `http://127.0.0.1:9000` | 对象存储（S3 兼容） |
+| MinIO Console | `http://127.0.0.1:9001` | 账号 `minioadmin` / `minioadmin` |
+
+`minio-init` 会自动创建 bucket `compliance`。将 `.env.example` 中 MinIO 段复制到 `.env` 即可（默认已对齐）。
+
+检查：`GET /healthz` 的 `checks.s3` 应为 `ok: true`。
 
 ### 4) 启动 Celery worker（队列消费者）
 
-**Windows** 下 Celery 不支持默认的 fork 进程池，必须加 `--pool=solo`（或 `--pool=threads`）：
+推荐按场景分队列（PR 快车道 / 版本慢扫 / 解析 / 导入）：
+
+**Windows**（必须 `--pool=solo` 或 `threads`）：
 
 ```powershell
-celery -A app.core.celery_app:celery_app worker -l INFO -Q compliance_scan --pool=solo
+# 可开多个终端，分别消费不同队列
+celery -A app.core.celery_app:celery_app worker -l INFO -Q scan_pr,compliance_scan --pool=solo
+celery -A app.core.celery_app:celery_app worker -l INFO -Q scan_version --pool=solo
+celery -A app.core.celery_app:celery_app worker -l INFO -Q parse,import --pool=solo
 ```
 
-**Linux / macOS** 可使用默认池：
+**Linux / macOS**：
 
 ```bash
-celery -A app.core.celery_app:celery_app worker -l INFO -Q compliance_scan
+celery -A app.core.celery_app:celery_app worker -l INFO -Q scan_pr,scan_version,parse,import,compliance_scan
 ```
+
+MySQL 需执行增量 DDL：`scripts/migrate_schema_v3_pr_version.sql`（PR/版本幂等字段）。
 
 ### 5) 启动网关 API
 

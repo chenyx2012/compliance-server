@@ -1,23 +1,20 @@
 """
-MySQL 异步连接与会话管理。
+MySQL 异步 + 同步连接与会话管理。
 
-- 使用 SQLAlchemy 2.0 异步引擎（aiomysql）
-- 提供 get_db 依赖供路由注入 AsyncSession
-- init_db 在应用启动时创建表（若不存在）
+- async：aiomysql（FastAPI 路由）
+- sync：pymysql（Celery worker / Batch）
 """
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncGenerator
-from typing import TYPE_CHECKING
 
+from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import declarative_base
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 from app.core.config import settings
-
-if TYPE_CHECKING:
-    pass
 
 engine = create_async_engine(
     settings.database_url,
@@ -33,6 +30,14 @@ AsyncSessionLocal = async_sessionmaker(
     autocommit=False,
     autoflush=False,
 )
+
+_sync_url = settings.database_url.replace("+aiomysql", "+pymysql")
+sync_engine = create_engine(
+    _sync_url,
+    pool_pre_ping=True,
+    pool_recycle=3600,
+)
+SyncSessionLocal = sessionmaker(bind=sync_engine, autocommit=False, autoflush=False)
 
 Base = declarative_base()
 
@@ -51,11 +56,21 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def init_db() -> None:
-    """创建所有表（若不存在）。在应用启动时调用。连接失败时仅打日志，不抛异常。"""
-    import logging
-    import app.models  # noqa: F401 - 注册模型到 Base.metadata
+    """创建所有表（若不存在）；并种子写入 open_source_code_repo_mapping。"""
+    import app.models  # noqa: F401
+    from app.models.open_source_code_repo_mapping import seed_repo_mappings
+
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+        async with AsyncSessionLocal() as session:
+            try:
+                n = await seed_repo_mappings(session)
+                await session.commit()
+                if n:
+                    logging.info("init_db — seeded %d open_source_code_repo_mapping rows", n)
+            except Exception as e:
+                await session.rollback()
+                logging.warning("init_db seed skipped: %s", e)
     except Exception as e:
         logging.warning("init_db skipped (database may be unavailable): %s", e)

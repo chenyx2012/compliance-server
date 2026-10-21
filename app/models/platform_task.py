@@ -8,17 +8,14 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import Boolean, DateTime, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
-
-
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+from app.core.time_utils import beijing_now
 
 
 def _gen_task_id() -> str:
@@ -85,6 +82,55 @@ class PlatformTask(Base):
         default=0,
         comment="S3 扫描检测到的许可证冲突数量",
     )
+    target_repo_name: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        nullable=True,
+        default=None,
+        index=True,
+        comment="片段扫描目标知识库名",
+    )
+    # pr | version（默认 version=全量）
+    scan_mode: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="version",
+        index=True,
+        comment="扫描模式：pr=增量 / version=全量",
+    )
+    # 业务幂等键：repo@pr#N@sha 或 repo@version
+    business_key: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        default=None,
+        unique=True,
+        index=True,
+        comment="业务幂等键（社区 PR/版本）",
+    )
+    repo_name: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True, default=None, index=True, comment="仓库名"
+    )
+    pr_number: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True, default=None, comment="PR 号"
+    )
+    commit_sha: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True, default=None, index=True, comment="提交 SHA"
+    )
+    version_tag: Mapped[Optional[str]] = mapped_column(
+        String(128), nullable=True, default=None, comment="版本 tag"
+    )
+    # S2 后处理：pending / success / failed / skipped / partial
+    s2_postprocess_status: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="skipped",
+        comment="S2 后处理状态",
+    )
+    notify_fingerprint: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        default=None,
+        comment="最近一次 notify 幂等指纹",
+    )
 
     # -----------------------------------------------------------------------
     # 任务整体状态
@@ -134,21 +180,21 @@ class PlatformTask(Base):
     )
 
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, default=_utc_now, nullable=False, comment="任务创建时间（UTC）"
+        DateTime, default=beijing_now, nullable=False, comment="任务创建时间（北京时间）"
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
-        default=_utc_now,
-        onupdate=_utc_now,
+        default=beijing_now,
+        onupdate=beijing_now,
         nullable=False,
-        comment="任务最后更新时间（UTC）",
+        comment="任务最后更新时间（北京时间）",
     )
     # 软删除时间戳；非 NULL 表示已被逻辑删除
     deleted_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime,
         nullable=True,
         default=None,
-        comment="软删除时间（UTC），NULL 表示未删除",
+        comment="软删除时间（北京时间），NULL 表示未删除",
     )
 
     def __repr__(self) -> str:

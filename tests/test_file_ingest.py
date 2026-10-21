@@ -4,7 +4,6 @@ import io
 import json
 import zipfile
 
-import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -44,7 +43,11 @@ def test_build_dir_tree_text_leaf(tmp_path):
     assert leaf["content"]["text"].replace("\r\n", "\n") == "print('hi')\n"
 
 
-def test_files_ingest_upload_zip(override_get_db):
+def test_files_ingest_upload_zip(override_get_db, tmp_path, monkeypatch):
+    from app.core import config as cfg
+
+    monkeypatch.setattr(cfg.settings, "temp_storage_root", str(tmp_path))
+
     client = TestClient(app)
     zbytes = _mk_zip_bytes(
         {
@@ -56,26 +59,22 @@ def test_files_ingest_upload_zip(override_get_db):
     resp = client.post("/files/ingest", files={"file": ("repo.zip", zbytes, "application/zip")})
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["ok"] is True
+    assert body["status"] == "success"
     assert "ingest_id" in body
     assert body["meta"]["source"] == "upload"
     assert body["meta"]["type"] == "archive"
 
-    tree = body["tree"]
-    print("\n[tree:test_files_ingest_upload_zip]\n" + json.dumps(tree, ensure_ascii=False, indent=2))
-    readme = _find_node_by_path(tree, "README.md") or _find_node_by_path(tree, "repo/README.md")
-    assert readme is not None
-    assert readme["content"]["text"].startswith("# hello")
 
-
-def test_files_ingest_url_mock_clone(monkeypatch, override_get_db):
+def test_files_ingest_url_mock_clone(monkeypatch, override_get_db, tmp_path):
     """
     通过 URL 拉取改为 git clone；测试时 mock _clone_repo 避免真实 clone。
     """
-    import tempfile
     from pathlib import Path
 
     import app.services.file_ingest as fi
+    from app.core import config as cfg
+
+    monkeypatch.setattr(cfg.settings, "temp_storage_root", str(tmp_path))
 
     async def fake_clone(git_url: str, dest_dir: Path, *, timeout_seconds: int = 300):
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -89,14 +88,7 @@ def test_files_ingest_url_mock_clone(monkeypatch, override_get_db):
     resp = client.post("/files/ingest", data={"source_url": "https://github.com/o/r.git"})
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["ok"] is True
+    assert body["status"] == "success"
     assert "ingest_id" in body
     assert body["meta"]["source"] == "url"
     assert body["meta"]["type"] == "git"
-
-    tree = body["tree"]
-    print("\n[tree:test_files_ingest_url_mock_clone]\n" + json.dumps(tree, ensure_ascii=False, indent=2))
-    a_txt = _find_node_by_path(tree, "a.txt")
-    assert a_txt is not None
-    assert a_txt["content"]["text"].replace("\r\n", "\n") == "abc\n"
-
