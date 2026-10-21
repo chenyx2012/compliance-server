@@ -148,6 +148,11 @@ def healthz() -> Dict[str, Any]:
         checks["mysql"] = {"ok": True}
     except Exception as e:
         checks["mysql"] = {"ok": False, "error": str(e)}
+    # S1 OAT（scripts/fetch_oat.py 拉取）
+    checks["oat"] = {
+        "ok": (settings.oat_src_dir / "oat" / "__main__.py").is_file(),
+        "path": str(settings.oat_src_dir),
+    }
 
     critical_ok = checks["s3"].get("ok") or not checks["s3"].get("configured")
     status = "success" if critical_ok and checks["redis"].get("ok") else "degraded"

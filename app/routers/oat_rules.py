@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -24,6 +23,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.celery_app import celery_app
+from app.core.config import settings
 from app.core.database import get_db
 from app.models.oat_rule_config import OatRuleConfig
 from app.models.oat_scan_result import OatScanResult
@@ -40,16 +40,6 @@ from app.schemas.oat_rule import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["oat-rules"])
-
-# oat_python 内置默认 XML 路径
-_BUILTIN_DEFAULT_XML = (
-    Path(__file__).parent.parent
-    / "tools" / "oat_python" / "src" / "oat" / "resources" / "OAT-Default.xml"
-)
-_BUILTIN_COMMON_XML = (
-    Path(__file__).parent.parent
-    / "tools" / "oat_python" / "src" / "oat" / "resources" / "OAT-Common.xml"
-)
 
 
 # ===========================================================================
@@ -124,12 +114,8 @@ async def get_builtin_xml(
     variant: str = Query("default", description="default=OAT-Default.xml；common=OAT-Common.xml"),
 ) -> BuiltinXmlResponse:
     """返回 oat_python 随包携带的内置 XML 内容，供前端参考编写自定义规则。不可修改。"""
-    if variant == "common":
-        xml_path = _BUILTIN_COMMON_XML
-        filename = "OAT-Common.xml"
-    else:
-        xml_path = _BUILTIN_DEFAULT_XML
-        filename = "OAT-Default.xml"
+    filename = "OAT-Common.xml" if variant == "common" else "OAT-Default.xml"
+    xml_path = settings.oat_resources_dir / filename
 
     if not xml_path.exists():
         raise HTTPException(status_code=404, detail=f"builtin XML not found: {filename}")

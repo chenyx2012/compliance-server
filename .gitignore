@@ -86,7 +86,11 @@ uploads/
 # ========================================
 # 本地旁路大目录（不随网关部署）
 # - server/：compliance-sentry 源码镜像，独立部署
-# - tools/：根目录 OAT 副本；运行用的是 app/tools/oat_python
+# - tools/：根目录 OAT 副本（历史遗留）
+# - app/tools/compliance/：HiAgent/compliance 仓，由 scripts/fetch_oat.py 拉取
+# - app/tools/oat_python/：旧版 OAT 嵌套仓，已由 HiAgent/compliance 取代
 # ========================================
 /server/
 /tools/
+/app/tools/compliance/
+/app/tools/oat_python/

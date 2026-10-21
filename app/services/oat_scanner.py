@@ -1,11 +1,12 @@
 """
 OAT (Open source Audit Tool) 扫描服务。
 
-将 tools/oat_python 作为 S1 扫描服务集成到平台，不修改 oat_python 任何代码。
+将 HiAgent/compliance 仓的 OAT_python 作为 S1 扫描服务集成到平台，不修改 OAT 任何代码。
+OAT 仓由 scripts/fetch_oat.py 拉取到 settings.oat_repo_path（默认 app/tools/compliance）。
 
 调用机制：
-  通过 subprocess 以 PYTHONPATH 指向 oat_python/src 来执行 `python -m oat`，
-  无需将 oat_python 安装为系统包，完全隔离、不侵入三方库。
+  通过 subprocess 以 PYTHONPATH 指向 <oat_repo>/OAT_python/src 来执行 `python -m oat`，
+  无需将 OAT 安装为系统包，完全隔离、不侵入三方库。
 
 规则叠加逻辑（与 oat_python loader.py 一致）：
   内置 OAT-Default.xml（oat_python 自带）
@@ -37,11 +38,33 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# oat_python 的 Python 包所在目录（tools/oat_python/src/oat/__init__.py）
-_OAT_SRC_DIR = Path(__file__).parent.parent / "tools" / "oat_python" / "src"
-
 # report_text 不做 Python 层截断，完整保存 PlainReport_*.txt 内容；
 # 数据库列类型为 MEDIUMTEXT（MySQL 最大 16 MB）。
+
+
+def _oat_missing_error() -> Optional[str]:
+    """OAT 未就绪时返回错误说明，就绪返回 None。"""
+    entry = settings.oat_src_dir / "oat" / "__main__.py"
+    if entry.is_file():
+        return None
+    return (
+        f"OAT not found at {settings.oat_src_dir}; "
+        "run `python scripts/fetch_oat.py` in compliance_sever to download it"
+    )
+
+
+def _empty_scan_result(error: str) -> Dict[str, Any]:
+    return {
+        "exit_code": -1,
+        "total_issues": 0,
+        "invalid_file_type_count": 0,
+        "license_header_invalid_count": 0,
+        "copyright_header_invalid_count": 0,
+        "report_text": "",
+        "stdout_tail": "",
+        "success": False,
+        "error": error,
+    }
 
 
 # ===========================================================================
@@ -149,6 +172,11 @@ async def run_oat_scan(
       license_header_invalid_count, copyright_header_invalid_count,
       report_text, stdout_tail, success
     """
+    missing = _oat_missing_error()
+    if missing:
+        logger.error("run_oat_scan — %s", missing)
+        return _empty_scan_result(missing)
+
     work_dir = Path(tempfile.mkdtemp(prefix="oat_work_"))
     try:
         report_dir = work_dir / "report"
@@ -175,7 +203,7 @@ async def run_oat_scan(
                 "run_oat_scan — using builtin default rules — project=%s", project_name
             )
 
-        env = {**os.environ, "PYTHONPATH": str(_OAT_SRC_DIR)}
+        env = {**os.environ, "PYTHONPATH": str(settings.oat_src_dir)}
 
         logger.info(
             "run_oat_scan start — project=%s src=%s cmd=%s",
@@ -436,6 +464,11 @@ def _run_oat_scan_sync(
     """
     import subprocess
 
+    missing = _oat_missing_error()
+    if missing:
+        logger.error("_run_oat_scan_sync — %s", missing)
+        return _empty_scan_result(missing)
+
     work_dir = Path(tempfile.mkdtemp(prefix="oat_work_"))
     try:
         report_dir = work_dir / "report"
@@ -454,7 +487,7 @@ def _run_oat_scan_sync(
             rule_xml_path.write_text(rule_xml_content, encoding="utf-8")
             cmd += ["-oatconfig", str(rule_xml_path)]
 
-        env = {**os.environ, "PYTHONPATH": str(_OAT_SRC_DIR)}
+        env = {**os.environ, "PYTHONPATH": str(settings.oat_src_dir)}
 
         logger.info(
             "_run_oat_scan_sync start — project=%s src=%s", project_name, source_dir

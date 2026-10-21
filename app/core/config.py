@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Optional
 from urllib.parse import quote_plus
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class Settings(BaseSettings):
@@ -45,6 +48,14 @@ class Settings(BaseSettings):
     pr_postprocess_ai_verify: bool = Field(default=True, alias="PR_POSTPROCESS_AI_VERIFY")
 
     temp_storage_root: str = Field(default="/tmp", alias="TEMP_STORAGE_ROOT")
+
+    # S1 OAT：来自 HiAgent/compliance 仓，部署时由 scripts/fetch_oat.py 拉取，不随本仓提交
+    oat_repo_url: str = Field(
+        default="https://gitcode.com/HiAgent/compliance.git", alias="OAT_REPO_URL"
+    )
+    oat_repo_ref: str = Field(default="", alias="OAT_REPO_REF")
+    oat_repo_dir: str = Field(default="app/tools/compliance", alias="OAT_REPO_DIR")
+    oat_python_subdir: str = Field(default="OAT_python", alias="OAT_PYTHON_SUBDIR")
 
     mysql_host: str = Field(default="127.0.0.1", alias="MYSQL_HOST")
     mysql_port: int = Field(default=3306, alias="MYSQL_PORT")
@@ -148,6 +159,21 @@ class Settings(BaseSettings):
             f"mysql+aiomysql://{user}:{password}"
             f"@{self.mysql_host}:{self.mysql_port}/{self.mysql_database}?charset={self.mysql_charset}"
         )
+
+    @property
+    def oat_repo_path(self) -> Path:
+        """OAT 仓本地目录；相对路径按 compliance_sever 项目根解析。"""
+        p = Path(self.oat_repo_dir)
+        return p if p.is_absolute() else PROJECT_ROOT / p
+
+    @property
+    def oat_src_dir(self) -> Path:
+        """`python -m oat` 所需的 PYTHONPATH（<repo>/OAT_python/src）。"""
+        return self.oat_repo_path / self.oat_python_subdir / "src"
+
+    @property
+    def oat_resources_dir(self) -> Path:
+        return self.oat_src_dir / "oat" / "resources"
 
 
 settings = Settings()

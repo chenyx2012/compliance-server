@@ -16,6 +16,8 @@
 - `app/services/file_ingest.py`：文件获取与目录树解析
 - `app/services/sentry_proxy.py`：compliance-sentry 请求透传
 - `app/routers/compliance_sentry.py`：compliance-sentry 全量接口路由
+- `app/services/oat_scanner.py`：S1 OAT 扫描（调用 HiAgent/compliance 仓的 `OAT_python`）
+- `scripts/fetch_oat.py`：拉取/升级 OAT 仓到 `app/tools/compliance`（不随本仓提交）
 - `app/schemas/scan.py`：扫描请求/响应模型
 - `app/core/database.py`：MySQL 异步连接与会话
 - `app/models/file_ingest.py`：文件解析结果表模型（目录树 + meta 入库）
@@ -59,6 +61,15 @@ copy .env.example .env
 ```
 
 编辑 `.env` 配置 Redis 与 **MySQL**（`MYSQL_HOST` / `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DATABASE` 等）。需先创建库：`CREATE DATABASE compliance_gateway CHARACTER SET utf8mb4;`
+
+**拉取 S1 扫描工具 OAT**（首次部署必做，仓库不包含 OAT 代码）：
+
+```bash
+python scripts/fetch_oat.py            # 克隆 https://gitcode.com/HiAgent/compliance 到 app/tools/compliance 并自检
+python scripts/fetch_oat.py --update   # 之后升级 OAT
+```
+
+扫描时使用 `<OAT_REPO_DIR>/OAT_python/src` 作为 `PYTHONPATH` 执行 `python -m oat`；地址、分支、目录可在 `.env` 中通过 `OAT_REPO_URL` / `OAT_REPO_REF` / `OAT_REPO_DIR` 覆盖。`/healthz` 的 `checks.oat` 显示是否就绪。
 
 ### 3) 启动 Redis + MinIO
 
