@@ -9,9 +9,10 @@ import logging
 import os
 from pathlib import Path
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from uuid import uuid4
 
-from celery import chain
+from celery import chain, group
 from celery.result import AsyncResult
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -123,8 +124,63 @@ def _normalize_modules(modules: Optional[List[str]]) -> Optional[List[str]]:
     return normalized
 
 
+def _enqueue_postprocess(
+    local_result_path: str, task_id: str, mode: str
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    """S2 结果后处理：解析 CSV → 并行导入开源/自研代码 → 导入全部结束后 AI 复核。
+
+    导入任务读取 scan_result_code_clone，必须在解析之后；AI 复核要读导入后的代码内容，
+    必须在导入之后。PR 模式按 PR_POSTPROCESS_IMPORTS / PR_POSTPROCESS_AI_VERIFY 跳过对应步骤。
+    """
+    run_imports = mode != "pr" or settings.pr_postprocess_imports
+    run_ai = mode != "pr" or settings.pr_postprocess_ai_verify
+    import_q = settings.celery_queue_import
+
+    steps: List[Any] = [
+        parse_csv_and_save.si(local_result_path, task_id).set(queue=settings.celery_queue_parse)
+    ]
+    open_source_info: Dict[str, Any] = {}
+    self_info: Optional[Dict[str, Any]] = None
+    if run_imports:
+        ids = {name: uuid4().hex for name in ("nvidia", "cpp", "java", "python", "self")}
+        steps.append(
+            group(
+                import_open_source_from_task_path2_nvidia.si(task_id, "nvidia").set(
+                    queue=import_q, task_id=ids["nvidia"]
+                ),
+                import_open_source_from_task_path2_cpp.si(task_id, "cpp").set(
+                    queue=import_q, task_id=ids["cpp"]
+                ),
+                import_open_source_from_task_path2_java.si(task_id, "java").set(
+                    queue=import_q, task_id=ids["java"]
+                ),
+                import_open_source_from_task_path2_python.si(task_id, "python").set(
+                    queue=import_q, task_id=ids["python"]
+                ),
+                import_self_developed_from_path1.si(task_id).set(queue=import_q, task_id=ids["self"]),
+            )
+        )
+        open_source_info = {
+            name: {"task_id": ids[name], "repo_name": name, "status": "submitted"}
+            for name in ("nvidia", "cpp", "java")
+        }
+        self_info = {
+            "task_id": ids["self"],
+            "repo_name": settings.self_developed_repo_name,
+            "status": "submitted",
+        }
+    if run_ai:
+        steps.append(
+            batch_ai_verify_task.si(None, task_id, True, True, False).set(
+                queue=settings.celery_queue_ai_verify
+            )
+        )
+    chain(*steps).apply_async()
+    return open_source_info, self_info
+
+
 @app.get("/healthz")
-def healthz() -> Dict[str, Any]:
+def healthz(deep: bool = False) -> Dict[str, Any]:
     from app.services.s3_client import health_check as s3_health
 
     checks: Dict[str, Any] = {"s3": s3_health()}
@@ -153,6 +209,15 @@ def healthz() -> Dict[str, Any]:
         "ok": (settings.oat_src_dir / "oat" / "__main__.py").is_file(),
         "path": str(settings.oat_src_dir),
     }
+    # AI 误报复核（开源大模型）：未配置时所有相似结果都会转人工；deep=true 时实际调用一次模型
+    from app.services.llm_client import llm_config, ping_model
+
+    ai = llm_config.describe()
+    ai["ok"] = ai["configured"]
+    if deep and ai["configured"]:
+        ai.update(ping_model())
+        ai["ok"] = ai["reachable"]
+    checks["ai"] = ai
 
     critical_ok = checks["s3"].get("ok") or not checks["s3"].get("configured")
     status = "success" if critical_ok and checks["redis"].get("ok") else "degraded"
@@ -365,75 +430,9 @@ async def scan_notify(request: ScanNotifyRequest) -> Dict[str, Any]:
 
         if local_result_path and Path(local_result_path).exists():
             try:
-                parse_q = settings.celery_queue_parse
-                import_q = settings.celery_queue_import
-                if postprocess_mode == "pr":
-                    if settings.pr_postprocess_ai_verify:
-                        chain(
-                            parse_csv_and_save.s(local_result_path, request.task_id),
-                            batch_ai_verify_task.s(request.task_id, True, True, False),
-                        ).apply_async(queue=parse_q)
-                    else:
-                        parse_csv_and_save.apply_async(
-                            args=[local_result_path, request.task_id],
-                            queue=parse_q,
-                        )
-                    if settings.pr_postprocess_imports:
-                        nvidia_ar = import_open_source_from_task_path2_nvidia.apply_async(
-                            args=[request.task_id, "nvidia"], queue=import_q
-                        )
-                        cpp_ar = import_open_source_from_task_path2_cpp.apply_async(
-                            args=[request.task_id, "cpp"], queue=import_q
-                        )
-                        java_ar = import_open_source_from_task_path2_java.apply_async(
-                            args=[request.task_id, "java"], queue=import_q
-                        )
-                        import_open_source_from_task_path2_python.apply_async(
-                            args=[request.task_id, "python"], queue=import_q
-                        )
-                        self_ar = import_self_developed_from_path1.apply_async(
-                            args=[request.task_id], queue=import_q
-                        )
-                        open_source_tasks_info = {
-                            "nvidia": {"task_id": nvidia_ar.id, "repo_name": "nvidia", "status": "submitted"},
-                            "cpp": {"task_id": cpp_ar.id, "repo_name": "cpp", "status": "submitted"},
-                            "java": {"task_id": java_ar.id, "repo_name": "java", "status": "submitted"},
-                        }
-                        self_developed_info = {
-                            "task_id": self_ar.id,
-                            "repo_name": settings.self_developed_repo_name,
-                            "status": "submitted",
-                        }
-                else:
-                    chain(
-                        parse_csv_and_save.s(local_result_path, request.task_id),
-                        batch_ai_verify_task.s(request.task_id, True, True, False),
-                    ).apply_async(queue=parse_q)
-                    nvidia_ar = import_open_source_from_task_path2_nvidia.apply_async(
-                        args=[request.task_id, "nvidia"], queue=import_q
-                    )
-                    cpp_ar = import_open_source_from_task_path2_cpp.apply_async(
-                        args=[request.task_id, "cpp"], queue=import_q
-                    )
-                    java_ar = import_open_source_from_task_path2_java.apply_async(
-                        args=[request.task_id, "java"], queue=import_q
-                    )
-                    import_open_source_from_task_path2_python.apply_async(
-                        args=[request.task_id, "python"], queue=import_q
-                    )
-                    self_ar = import_self_developed_from_path1.apply_async(
-                        args=[request.task_id], queue=import_q
-                    )
-                    open_source_tasks_info = {
-                        "nvidia": {"task_id": nvidia_ar.id, "repo_name": "nvidia", "status": "submitted"},
-                        "cpp": {"task_id": cpp_ar.id, "repo_name": "cpp", "status": "submitted"},
-                        "java": {"task_id": java_ar.id, "repo_name": "java", "status": "submitted"},
-                    }
-                    self_developed_info = {
-                        "task_id": self_ar.id,
-                        "repo_name": settings.self_developed_repo_name,
-                        "status": "submitted",
-                    }
+                open_source_tasks_info, self_developed_info = _enqueue_postprocess(
+                    local_result_path, request.task_id, postprocess_mode
+                )
             except Exception as e:
                 enqueue_ok = False
                 logger.warning("scan_notify — celery enqueue failed: %s", e)

@@ -91,7 +91,7 @@ docker compose up -d
 
 ### 4) 启动 Celery worker（队列消费者）
 
-推荐按场景分队列（PR 快车道 / 版本慢扫 / 解析 / 导入）：
+推荐按场景分队列（PR 快车道 / 版本慢扫 / 解析 / 导入 / AI 误报复核）：
 
 **Windows**（必须 `--pool=solo` 或 `threads`）：
 
@@ -100,13 +100,19 @@ docker compose up -d
 celery -A app.core.celery_app:celery_app worker -l INFO -Q scan_pr,compliance_scan --pool=solo
 celery -A app.core.celery_app:celery_app worker -l INFO -Q scan_version --pool=solo
 celery -A app.core.celery_app:celery_app worker -l INFO -Q parse,import --pool=solo
+celery -A app.core.celery_app:celery_app worker -l INFO -Q ai_verify --pool=solo
 ```
 
 **Linux / macOS**：
 
 ```bash
-celery -A app.core.celery_app:celery_app worker -l INFO -Q scan_pr,scan_version,parse,import,compliance_scan
+celery -A app.core.celery_app:celery_app worker -l INFO -Q scan_pr,scan_version,parse,import,ai_verify,compliance_scan
 ```
+
+**AI 误报复核**：S2 结果解析入库后（版本模式还要等开源/自研代码导入完成）自动触发，回填 `scan_result_code_clone.ai_judgment`。
+模型使用开源大模型（任意 OpenAI 兼容服务，生产为 910B 上的 vLLM Ascend），需在 `.env` 配置 `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL`，否则所有结果判「需要人工确认」；用 `GET /healthz?deep=true` 的 `checks.ai` 验证。
+本地开发可用 Ollama：`LLM_BASE_URL=http://127.0.0.1:11434/v1`、`LLM_MODEL=qwen2.5-coder:7b`。
+判定顺序：片段缺失 → Redis 缓存 → 误报案例库（`ai_false_positive_cases`）→ 调用模型；模型判为无风险的片段对会自动沉淀进案例库。
 
 MySQL 需执行增量 DDL：`scripts/migrate_schema_v3_pr_version.sql`（PR/版本幂等字段）。
 

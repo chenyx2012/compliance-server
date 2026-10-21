@@ -1,4 +1,7 @@
-"""误报分类路由（/api/v1/classifier）。"""
+"""误报分类路由（/api/v1/classifier）。
+
+调用模型的端点用普通 def：FastAPI 会放进线程池执行，避免阻塞事件循环。
+"""
 
 from __future__ import annotations
 
@@ -7,11 +10,12 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
+from app.core.config import settings
+from app.services.ai_verify import VerifyItem, judge_items
 from app.services.false_positive import (
     ai_analyze,
     comparison_analyze,
     integrated_analysis,
-    qwen_predict,
 )
 from app.tasks.batch_ai_verify_tasks import batch_ai_verify_task
 
@@ -27,7 +31,7 @@ class SnippetPair(BaseModel):
 
 
 class IntegratedBody(SnippetPair):
-    ai_type: str = Field(default="huawei_ai")
+    ai_type: str = Field(default="auto", description="llm / selfdeveloped_ai / dual / auto（huawei_ai 视为 llm）")
 
 
 @router.get("/health")
@@ -36,7 +40,7 @@ async def health() -> Dict[str, Any]:
 
 
 @router.post("/analyze")
-async def analyze(body: SnippetPair) -> Dict[str, Any]:
+def analyze(body: SnippetPair) -> Dict[str, Any]:
     r = ai_analyze(
         original_snippet=body.original_snippet,
         open_source_snippet=body.open_source_snippet,
@@ -63,7 +67,7 @@ async def decide(body: SnippetPair) -> Dict[str, Any]:
 
 
 @router.post("/ai-analyze")
-async def api_ai_analyze(body: SnippetPair) -> Dict[str, Any]:
+def api_ai_analyze(body: SnippetPair) -> Dict[str, Any]:
     return {"success": True, **ai_analyze(
         original_snippet=body.original_snippet,
         open_source_snippet=body.open_source_snippet,
@@ -72,7 +76,7 @@ async def api_ai_analyze(body: SnippetPair) -> Dict[str, Any]:
 
 
 @router.post("/comparison-analyze")
-async def api_comparison(body: Dict[str, Any]) -> Dict[str, Any]:
+def api_comparison(body: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "success": True,
         **comparison_analyze(
@@ -85,7 +89,7 @@ async def api_comparison(body: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @router.post("/integrated-analysis")
-async def api_integrated(body: IntegratedBody) -> Dict[str, Any]:
+def api_integrated(body: IntegratedBody) -> Dict[str, Any]:
     return {
         "success": True,
         **integrated_analysis(
@@ -98,23 +102,42 @@ async def api_integrated(body: IntegratedBody) -> Dict[str, Any]:
 
 
 @router.post("/batch-integrated-analysis")
-async def batch_integrated(body: Dict[str, Any]) -> Dict[str, Any]:
+def batch_integrated(body: Dict[str, Any]) -> Dict[str, Any]:
     cases: List[Dict[str, Any]] = body.get("cases") or body.get("items") or []
-    ai_type = body.get("ai_type") or "huawei_ai"
-    results = []
+    items = []
     for i, c in enumerate(cases):
-        r = integrated_analysis(
-            original_snippet=c.get("original_snippet") or c.get("code_snippet") or "",
-            open_source_snippet=c.get("open_source_snippet") or "",
-            similarity=c.get("similarity"),
-            ai_type=ai_type,
+        original = c.get("original_snippet") or c.get("code_snippet") or ""
+        open_source = c.get("open_source_snippet") or ""
+        missing = "" if original.strip() and open_source.strip() else "片段为空，需人工确认"
+        items.append(
+            VerifyItem(
+                key=i,
+                original=original,
+                open_source=open_source,
+                similarity=c.get("similarity"),
+                missing=missing,
+            )
         )
-        results.append({"index": i, **r})
-    return {"success": True, "total": len(results), "results": results}
+    outcome = judge_items(
+        items,
+        ai_type=body.get("ai_type") or "auto",
+        use_redis=body.get("use_redis", True),
+        concurrency=settings.ai_verify_concurrency,
+    )
+    results = [
+        {
+            "index": i,
+            "judgment": outcome.verdicts[i].judgment,
+            "reason": outcome.verdicts[i].reason,
+            "source": outcome.verdicts[i].source,
+        }
+        for i in range(len(items))
+    ]
+    return {"success": True, "total": len(results), "stats": outcome.stats, "results": results}
 
 
 @router.post("/batch-ai-verify")
-async def batch_ai_verify(body: Dict[str, Any]) -> Dict[str, Any]:
+def batch_ai_verify(body: Dict[str, Any]) -> Dict[str, Any]:
     task_id = body.get("task_id")
     if not task_id:
         return {"ok": False, "error": "task_id 是必填项"}
@@ -124,6 +147,7 @@ async def batch_ai_verify(body: Dict[str, Any]) -> Dict[str, Any]:
             "use_rag": body.get("use_rag", True),
             "use_redis": body.get("use_redis", True),
             "force": body.get("force", False),
+            "ai_type": body.get("ai_type"),
         }
     )
     return {"ok": True, "celery_task_id": ar.id, "task_id": task_id}

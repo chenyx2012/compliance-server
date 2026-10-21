@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     celery_queue_scan_version: str = Field(default="scan_version", alias="CELERY_QUEUE_SCAN_VERSION")
     celery_queue_parse: str = Field(default="parse", alias="CELERY_QUEUE_PARSE")
     celery_queue_import: str = Field(default="import", alias="CELERY_QUEUE_IMPORT")
+    celery_queue_ai_verify: str = Field(default="ai_verify", alias="CELERY_QUEUE_AI_VERIFY")
     celery_result_expires_seconds: int = Field(default=86400, alias="CELERY_RESULT_EXPIRES_SECONDS")
     # S2 异步受理超时（秒）；真 SSCD 同步模式仍可用长超时
     s2_accept_timeout_seconds: float = Field(default=120.0, alias="S2_ACCEPT_TIMEOUT_SECONDS")
@@ -128,7 +129,17 @@ class Settings(BaseSettings):
         alias="SELF_DEVELOPED_FILE_TYPES",
     )
 
-    ai_model_default: str = Field(default="Qwen-V3.6-35B-A3B", alias="AI_MODEL_DEFAULT")
+    # 开源大模型（vLLM / vLLM Ascend 等 OpenAI 兼容服务），供误报复核与 /api/v1/ai 使用
+    llm_base_url: str = Field(default="", alias="LLM_BASE_URL")
+    llm_api_key: str = Field(default="", alias="LLM_API_KEY")
+    llm_model: str = Field(default="", alias="LLM_MODEL")
+    # 自研 Qwen LoRA 误报服务（/predict、/reasoning）；留空表示未部署
+    qwen_fp_base_url: str = Field(default="", alias="QWEN_FP_BASE_URL")
+    # auto：配置了 Qwen 则双模型并行初判，否则仅大模型；也可显式 llm / selfdeveloped_ai / dual
+    ai_verify_mode: str = Field(default="auto", alias="AI_VERIFY_MODE")
+    # 单个复核任务内并发调用大模型的线程数（总并发 = ai_verify worker 数 × 本值）
+    ai_verify_concurrency: int = Field(default=8, alias="AI_VERIFY_CONCURRENCY")
+    ai_cache_ttl_seconds: int = Field(default=7 * 86400, alias="AI_CACHE_TTL_SECONDS")
 
     # 上传凭据：uploader_token → app_token → access_key（MinIO）
     @property

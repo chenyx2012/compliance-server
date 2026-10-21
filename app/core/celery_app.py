@@ -26,7 +26,7 @@ celery_app.conf.update(
     task_routes={
         "platform_tasks.s2_scan": {"queue": settings.celery_queue_scan_version},
         "platform.parse_csv_and_save": {"queue": settings.celery_queue_parse},
-        "platform.batch_ai_verify_task": {"queue": settings.celery_queue_parse},
+        "platform.batch_ai_verify_task": {"queue": settings.celery_queue_ai_verify},
         "platform.import_open_source_from_task_path2_nvidia": {"queue": settings.celery_queue_import},
         "platform.import_open_source_from_task_path2_cpp": {"queue": settings.celery_queue_import},
         "platform.import_open_source_from_task_path2_java": {"queue": settings.celery_queue_import},
